@@ -1,0 +1,544 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use CGI;
+use File::Temp qw/ tempfile tempdir /;
+use LWP::UserAgent;
+use Data::Dumper;
+use Bio::Graphics::Browser2;
+use Bio::Graphics::Browser2::Session;
+use Config::Tiny;
+use File::Spec::Unix;
+$Data::Dumper::Terse = 1;
+
+my $conf_file = "/etc/gbrowse_addons.ini";
+my $cfg = Config::Tiny->new;
+$cfg = Config::Tiny->read($conf_file);
+
+my $working_dir = $cfg->{main}{gbrowse_job_daemon_location};
+unless( $working_dir =~ /.*\/$/ ) {
+	$working_dir .= "/";
+}
+print STDERR "WORKING DIRECTORY: $working_dir\n";
+chdir $working_dir;
+
+my $q = new CGI;
+
+my $globals = Bio::Graphics::Browser2->open_globals;
+my $session = $globals->session;
+my $sessionid = $session->id;
+my $uploadsid = $session->uploadsid;
+my $username  = $session->username;
+if(!$username) {
+	print $q->header;
+	print $q->start_html( -title => 'Calculate Expression Ratios',
+				-style => ['http://fonts.googleapis.com/css?family=Lato','../../expression_ratios.css'],
+				-script => {-type => 'JAVASCRIPT',
+							-src => '../../expression_ratios.js'
+							}
+				);
+	print $q->b("Oops! You aren't logged in");
+	print $q->end_html;
+} else {
+	if($q->param('submit_cve_form')) {
+		print $q->header;
+		print $q->start_html( -title => 'Calculate Expression Ratios',
+						-style => ['http://fonts.googleapis.com/css?family=Lato','../../expression_ratios.css'],
+						-script => {-type => 'JAVASCRIPT',
+									-src => '../../expression_ratios.js'
+									}
+						);
+
+		# getting parameters and prepping file uploads
+		my ($cookie, $session, $email) = store_cookie();
+		my $job_name = $q->param('cve_job_name');
+		$job_name =~ s/ /-/g;
+		my $temp;
+
+		# Untainting the parameters passed into the form
+		if( $q->param('cve_control') =~ /([^|;*<>?]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted file upload!!";
+		}
+		# my $control_file = store_file($temp);
+		my $control_file = store_file('cve_control');
+
+		if( $q->param('cve_experimental') =~ /([^|;*<>?]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted file upload!!";
+		}
+		# my $experimental_file = store_file($temp);
+		my $experimental_file = store_file('cve_experimental');
+
+		if( $q->param('cve_reference') =~ /([a-zA-Z0-9]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted reference database given!";
+		}
+		# Store the parameters in a hash to be dumped to a file
+		my %parameters = (
+			'task'         => 'cve',
+			'control'      => $control_file,
+			'experimental' => $experimental_file,
+			'reference'    => $temp
+		);
+
+		my $param_file = store_params(\%parameters);
+		my $upload_data = store_upload_params('', $job_name, 'featurefile');
+
+		# Prepare the jobs line to be added to the gbrowse_job_daemon job file. The daemon will parse this line to setup the requested job
+		my $job_line = "expression";
+		$job_line .= "|$cookie";
+		$job_line .= "|$session";
+		$job_line .= "|$param_file";
+		$job_line .= "|$email";
+		$job_line .= "|$job_name";
+		$job_line .= "|$upload_data";
+
+
+		add_to_jobs($job_line);
+		print $q->start_div({class=>"response"});
+		print "Job request submitted!<br>You will receive an email when your job is complete";
+		print $q->end_div;
+		print $q->end_html;
+	} elsif($q->param('submit_dvr_form')) {
+		print $q->header;
+		print $q->start_html( -title => 'Calculate Expression Ratios',
+						-style => ['http://fonts.googleapis.com/css?family=Lato','../../expression_ratios.css'],
+						-script => {-type => 'JAVASCRIPT',
+									-src => '../../expression_ratios.js'
+									}
+						);
+
+		# getting parameters and prepping file uploads
+		my ($cookie, $session, $email) = store_cookie();
+		my $job_name = $q->param('dvr_job_name');
+		$job_name =~ s/ /-/g;
+		my $temp;
+
+		# Untainting the parameters passed into the form
+		if( $q->param('dvr_dna') =~ /([^|;*<>?]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted file upload!!";
+		}
+		my $dna_file = store_file('dvr_dna');
+		if( $q->param('dvr_rna') =~ /([^|;*<>?]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted file upload!!";
+		}
+		my $rna_file = store_file('dvr_rna');
+		if( $q->param('dvr_reference') =~ /([a-zA-Z0-9]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted reference database given!";
+		}
+
+		# Store the parameters in a hash to be dumped to a file
+		my %parameters = (
+			'task'      => 'dvr',
+			'dna'       => $dna_file,
+			'rna'       => $rna_file,
+			'reference' => $temp
+		);
+
+		my $param_file = store_params(\%parameters);
+		my $upload_data = store_upload_params('', $job_name, 'featurefile');
+
+		# Prepare the jobs line to be added to the gbrowse_job_daemon job file. The daemon will parse this line to setup the requested job
+		my $job_line = "expression";
+		$job_line .= "|$cookie";
+		$job_line .= "|$session";
+		$job_line .= "|$param_file";
+		$job_line .= "|$email";
+		$job_line .= "|$job_name";
+		$job_line .= "|$upload_data";
+
+		
+		add_to_jobs($job_line);
+
+		print $q->start_div({class=>"response"});
+		print "Job request submitted!<br>You will receive an email when your job is complete";
+		print $q->end_div;
+		print $q->end_html;
+	} elsif($q->param('submit_dor_form')) {
+		print $q->header;
+		print $q->start_html( -title => 'Calculate Expression Ratios',
+						-style => ['http://fonts.googleapis.com/css?family=Lato','../../expression_ratios.css'],
+						-script => {-type => 'JAVASCRIPT',
+									-src => '../../expression_ratios.js'
+									}
+						);
+
+		# getting parameters and prepping file uploads
+		my ($cookie, $session, $email) = store_cookie();
+		my $job_name = $q->param('dor_job_name');
+		$job_name =~ s/ /-/g;
+		my $temp;
+
+		# Untainting the parameters passed into the form
+		if( $q->param('fileUpload') =~ /([^|;*<>?]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted file upload!!";
+		}
+		my $file = store_file('fileUpload');
+		if( $q->param('dor_reference') =~ /([a-zA-Z0-9]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted reference database given!";
+		}
+
+		# Store the parameters in a hash to be dumped to a file
+		my %parameters = (
+			'task'      => 'dor',
+			'file'      => $file,
+			'reference' => $temp
+		);
+
+		my $param_file = store_params(\%parameters);
+		my $upload_data = store_upload_params('', $job_name, 'featurefile');
+
+		# Prepare the jobs line to be added to the gbrowse_job_daemon job file. The daemon will parse this line to setup the requested job
+		my $job_line = "expression";
+		$job_line .= "|$cookie";
+		$job_line .= "|$session";
+		$job_line .= "|$param_file";
+		$job_line .= "|$email";
+		$job_line .= "|$job_name";
+		$job_line .= "|$upload_data";
+
+		add_to_jobs($job_line);
+
+		print $q->start_div({class=>"response"});
+		print "Job request submitted!<br>You will receive an email when your job is complete";
+		print $q->end_div;
+
+		print $q->end_html;
+	} elsif($q->param('submit_dorm_form')) {
+		print $q->header;
+		print $q->start_html( -title => 'Calculate Expression Ratios',
+						-style => ['http://fonts.googleapis.com/css?family=Lato','../../expression_ratios.css'],
+						-script => {-type => 'JAVASCRIPT',
+									-src => '../../expression_ratios.js'
+									}
+						);
+
+		# getting parameters and prepping file uploads
+		my ($cookie, $session, $email) = store_cookie();
+		my $job_name = $q->param('dorm_job_name');
+		$job_name =~ s/ /-/g;
+
+		# store each of the uploaded files in a tempfile
+		my @files = map {
+			my ($tmp_fh, $fname) = tempfile( DIR => $working_dir."blast_targets/");
+			my $fh = $_;
+			while(my $line = <$fh>) {
+				print $tmp_fh $line;
+			}
+			close $fh;
+			close $fname;
+			$fname;
+			} $q->upload('dorm_upload');
+		map{ print $q->b("File: $_<br>"); } @files;
+		my $temp;
+		if( $q->param('dorm_reference') =~ /([a-zA-Z0-9]{0,250})/ ){
+			$temp = $1;
+		} else {
+			die "Tainted reference database given!";
+		}
+
+		# Store the parameters in a hash to be dumped to a file
+		my %parameters = (
+			'task'      => 'dorm',
+			'files'     => \@files,
+			'reference' => $temp
+		);
+
+		my $param_file = store_params(\%parameters);
+		my $upload_data = store_upload_params('', $job_name, 'featurefile');
+
+		# Prepare the jobs line to be added to the gbrowse_job_daemon job file. The daemon will parse this line to setup the requested job
+		my $job_line = "expression";
+		$job_line .= "|$cookie";
+		$job_line .= "|$session";
+		$job_line .= "|$param_file";
+		$job_line .= "|$email";
+		$job_line .= "|$job_name";
+		$job_line .= "|$upload_data";
+
+		add_to_jobs($job_line);
+		print $q->start_div({class=>"response"});
+		print "Job request submitted!<br>You will receive an email when your job is complete";
+		print $q->end_div;
+		print $q->end_html;
+	} else {
+		print_html();		
+	}
+}
+
+sub add_to_jobs {
+	use Fcntl qw(:DEFAULT :flock);
+	use Tie::File;
+
+	my $job_string = shift;
+
+	my @jobs;
+	my $tie = tie @jobs, "Tie::File", "jobs" or die "Unable to tie jobs file";
+	$tie->flock;
+
+	push(@jobs, $job_string);
+	$tie = undef;
+	untie @jobs;
+
+	return 1;
+}
+
+# Doesn't work
+sub store_file2 {
+	my $upload_filename = shift;
+	print STDERR "UPLOADED FILE: $upload_filename\n";
+	print STDERR "UPLOADED FILE EXISTS: ".(-e $upload_filename)."\n";
+
+	my ($fh, $fname) = tempfile( DIR => $working_dir."blast_targets/");
+	my $tmp_str = do{ local $/ = undef; <$upload_filename>};
+	print $fh $tmp_str;
+	$upload_filename = $fname;
+	close $fname;
+
+	return $fname;
+}
+
+# Reads uploaded files line by line into a tempfile for later use
+sub store_file {
+	my $target = shift;
+
+	my ($tmp_fh, $fname) = tempfile( DIR => $working_dir."blast_targets/");
+	my $fh = $q->upload($target);
+	while(my $line = <$fh>) {
+		print $tmp_fh $line;
+	}
+	close $fh;
+	close $fname;
+
+	print STDERR "File: $fname stored\n";
+
+	return $fname;
+}
+
+# Store the clients authentication cookie in tempfiles for use later uploading tracks
+sub store_cookie {
+	use Bio::Graphics::Browser2;
+	use Bio::Graphics::Browser2::Session;
+	use Bio::Graphics::Browser2::UserDB;
+	use CGI::Cookie;
+
+	my $globals = Bio::Graphics::Browser2->open_globals;
+	my $userdb = Bio::Graphics::Browser2::UserDB->new($globals);
+	my $session = $globals->session;
+	my $email = $userdb->email_from_sessionid($session->id);
+	my $sessionid = $session->id;
+	my $username = $session->username;
+	my %cookies = CGI::Cookie->fetch;
+	unless($username) {
+		die "User is not logged in";
+	}
+
+	# write cookies and session out to a file
+	my ($cookies_fh, $cookies_filename) = tempfile( DIR => $working_dir."cookies/");
+	select((select($cookies_fh), $|=1)[0]);
+	print $cookies_fh Dumper(\%cookies);
+	my ($sessions_fh, $sessions_filename) = tempfile( DIR => $working_dir."sessions/");
+	select((select($sessions_fh), $|=1)[0]);
+	print $sessions_fh $session->id;
+
+	close $cookies_filename;
+	close $sessions_filename;
+
+	return $cookies_filename, $sessions_filename, $email;
+}
+
+# store the parameters hash in a file to be used by the gbrowse_job_daemon
+sub store_params {
+	my %params = %{shift()};
+
+	my ($config_fh, $config_filename) = tempfile( DIR => $working_dir."configs/");
+	select((select($config_fh), $|=1)[0]);
+	print $config_fh Dumper(\%params);
+	close $config_filename;
+
+	return $config_filename;
+}
+
+# print out the html form
+sub print_html {
+	my $ua = LWP::UserAgent->new;
+	my $response = $ua->get('http://localhost/cgi-bin/gb2/gbrowse/Toceanica2/?action=list');
+	my $content = $response->content;
+	my @datasources = $content =~ /^[a-zA-Z0-9_]+/smg;
+
+	# The page actually contains multiple forms stacked ontop of eachother
+	# uses Javascript to set CSS properties to show and hide the different forms when the user clicks on a tab
+	print $q->header;
+	print $q->start_html( -title => 'Calculate Expression Ratios',
+						-style => ['http://fonts.googleapis.com/css?family=Lato','../../expression_ratios.css'],
+						-script => {-type => 'JAVASCRIPT',
+									-src => '../../expression_ratios.js'
+									}
+						);
+	print $q->start_div({-id=> "selector"});
+
+	 	print $q->start_div({
+	 		id=>"first",
+	 		-class=>'selected',
+			-onClick=>"show(this,'control_vs_experimental','forms');"});
+	 	print "Control vs. Experimental";
+	 	print $q->end_div;
+
+	 	print $q->start_div({
+			-onClick=>"show(this,'dna_vs_rna','forms');"});
+	 	print 'DNA vs. RNA';
+	 	print $q->end_div;
+
+	 	print $q->start_div({
+			-onClick=>"show(this,'dna_or_rna_single','forms');"});
+	 	print 'DNA or RNA Single Sample';
+	 	print $q->end_div;
+
+	 	print $q->start_div({
+			-onClick=>"show(this,'dna_or_rna_multiple','forms');"});
+	 	print 'DNA or RNA Multi Sample';
+	 	print $q->end_div;
+
+ 	print $q->end_div;
+	print $q->start_div({-id=> "forms"});
+
+		print $q->start_div({-id=> "control_vs_experimental", -class=> "shown", -style => "text-align: center"});
+		print $q->start_form(
+			-name    => 'control_vs_experimental',
+			-method  => 'POST',
+			-enctype => &CGI::MULTIPART
+		);
+		print $q->h2("Control vs. Experimental");
+		print $q->label({-for => "cve_job_name"}, "Job Name: "), $q->textfield(-id => "cve_job_name", -name=>"cve_job_name", -default=> "", -size=>10, -maxlength=>100);
+		print $q->label({-for =>"cve_control"}, "Upload Control Fasta: "),$q->filefield(-name=> "cve_control", -id=> "cve_control", -default=>'',-size=>50,-maxlength=>150);
+		print $q->label({-for =>"cve_experimental"}, "Upload Experimental Fasta: "),$q->filefield(-name=> "cve_experimental", -id=> "cve_experimental", -default=>'',-size=>50,-maxlength=>150);
+		print $q->br,$q->br,$q->label({-for => 'cve_reference'}, "Reference Database: "), $q->popup_menu(-name => "cve_reference", -id => "cve_reference", -values => \@datasources, default => "Toceanica2" );
+		print $q->submit(
+			-id    => 'submit_cve',
+			-name  => 'submit_cve_form',
+			-value => 'Calculate Expression!');
+		print $q->end_form;
+		print $q->end_div;
+
+		print $q->start_div({-id=> "dna_vs_rna", -class=> "hidden", -style => "text-align: center"});
+		print $q->start_form(
+			-name    => 'dna_vs_rna',
+			-method  => 'POST',
+			-enctype => &CGI::MULTIPART
+		);
+		print $q->h2("DNA vs. RNA");
+		print $q->label({-for => "dvr_job_name"}, "Job Name: "), $q->textfield(-id => "dvr_job_name", -name=>"dvr_job_name", -default=> "", -size=>10, -maxlength=>100);
+		print $q->label({-for =>"dvr_dna"}, "Upload DNA Fasta: "),$q->filefield(-name=> "dvr_dna", -id=> "dvr_dna", -default=>'',-size=>50,-maxlength=>150);
+		print $q->label({-for =>"dvr_rna"}, "Upload RNA Fasta: "),$q->filefield(-name=> "dvr_rna", -id=> "dvr_rna", -default=>'',-size=>50,-maxlength=>150);
+		print $q->br,$q->br,$q->label({-for => 'dvr_reference'}, "Reference Database: "), $q->popup_menu(-name => "dvr_reference", -id => "dvr_reference", -values => \@datasources, default => "Toceanica2" );
+		print $q->submit(
+			-id    => 'submit_dvr',
+			-name  => 'submit_dvr_form',
+			-value => 'Calculate Expression!');
+		print $q->end_form;
+		print $q->end_div;
+
+		print $q->start_div({-id=> "dna_or_rna_single", -class=> "hidden", -style => "text-align: center"});
+		print $q->start_form(
+			-name    => 'dna_or_rna_single',
+			-method  => 'POST',
+			-enctype => &CGI::MULTIPART
+		);
+		print $q->h2("DNA or RNA, single sample");
+		print $q->label({-for => "dor_job_name"}, "Job Name: "), $q->textfield(-id => "dor_job_name", -name=>"dor_job_name", -default=> "", -size=>10, -maxlength=>100);
+		print $q->label({-for =>"fileUpload"}, "Upload Sequence file: "),$q->filefield(-name=> "fileUpload", -id=> "fileUpload", -default=>'',-size=>50,-maxlength=>150);
+		print $q->br,$q->br,$q->label({-for => 'dor_reference'}, "Reference Database: "), $q->popup_menu(-name => "dor_reference", -id => "dor_reference", -values => \@datasources, default => "Toceanica2" );
+		print $q->submit(
+			-id    => 'submit_dor',
+			-name  => 'submit_dor_form',
+			-value => 'Calculate Expression!');
+		print $q->end_form;
+		print $q->end_div;
+
+		print $q->start_div({-id=> "dna_or_rna_multiple", -class=> "hidden", -style => "text-align: center"});
+		print $q->start_form(
+			-name    => 'dna_or_rna_multiple',
+			-method  => 'POST',
+			-enctype => &CGI::MULTIPART
+		);
+		print $q->h2("DNA or RNA, multiple sample");
+		print $q->label({-for => "dorm_job_name"}, "Job Name: "), $q->textfield(-id => "dorm_job_name", -name=>"dorm_job_name", -default=> "", -size=>10, -maxlength=>100);
+		print "<br><br>Hold Shift or Control when clicking to select multiple files<br>";
+		print $q->label({-for => "dorm_upload"}, "Please select files: "),"<input id=\"dorm_upload\" type=\"file\" name=\"dorm_upload\" multiple>";
+		print $q->br,$q->br,$q->label({-for => 'dorm_reference'}, "Reference Database: "), $q->popup_menu(-name => "dorm_reference", -id => "dorm_reference", -values => \@datasources, default => "Toceanica2" );
+		print $q->submit(
+			-id    => 'submit_dorm',
+			-name  => 'submit_dorm_form',
+			-value => 'Calculate Expression!');
+		print $q->end_form;
+		print $q->end_div;
+
+	print $q->end_div;
+	print $q->end_html;
+}
+
+# store_params($upload_target, $upload_name, $upload_type)
+# 	$upload_type = 'gff3' or 'featurefile'
+# 	returns the name of the tempfile where the params have been stored
+sub store_upload_params {
+	use File::Temp qw/ tempfile /;
+	use Bio::Graphics::Browser2;
+	use Bio::Graphics::Browser2::Session;
+	use Bio::Graphics::Browser2::UserDB;
+	use Bio::Graphics::Browser2::Render;
+	use Bio::Graphics::Browser2::UserTracks;
+	use Data::Dumper;
+	$Data::Dumper::Terse = 1;
+	
+	my $upload_target = shift;
+	my $upload_name   = shift;
+	my $upload_type   = shift;
+
+	my $globals     = Bio::Graphics::Browser2->open_globals;
+	my $userdb      = Bio::Graphics::Browser2::UserDB->new($globals);
+	my $render      = Bio::Graphics::Browser2::Render->new($globals);
+	my $session     = $render->session;
+	my $data_source = $render->data_source;
+	my $user_tracks = Bio::Graphics::Browser2::UserTracks->new($data_source,$session);
+
+	my $userid         = $userdb->get_user_id($userdb->email_from_sessionid($session->id));
+	my $current_source = ${$session->config_hash}{'page_settings'}{'source'};
+	my $upload_dir     = $globals->user_dir;
+	my $uploadsid      = $session->uploadsid;
+	my $account_db      = $globals->user_account_db;
+
+	my %upload_data;
+	$upload_data{'upload_target'} = $upload_target;
+	$upload_data{'upload_name'}   = $upload_name;
+	$upload_data{'upload_type'}   = $upload_type;
+
+	$upload_data{'userid'}         = $userid;
+	$upload_data{'current_source'} = $current_source;
+	$upload_data{'upload_dir'}     = $upload_dir;
+	$upload_data{'uploadsid'}      = $uploadsid;
+	$upload_data{'account_db'}     = $account_db;
+
+	my ($data_fh, $data_filename) = tempfile;
+	select((select($data_fh), $|=1)[0]);
+	print $data_fh Dumper(\%upload_data);
+	close $data_filename;
+
+	return $data_filename;
+}
+
+1;

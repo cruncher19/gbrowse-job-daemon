@@ -1,0 +1,405 @@
+#!/usr/bin/perl
+
+use CGI qw/:standard delete_all escapeHTML/;
+use CGI::Carp qw(fatalsToBrowser);
+use Config::Tiny;
+use File::Spec::Unix;
+use warnings;
+use strict;
+$|++;
+
+$ENV{PATH} = "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin";
+$ENV{HOME} = "/tmp";
+
+my @accession_numbers;
+my $flat_accession_num = join(' ', @accession_numbers);
+my $db_name            = '';
+my $db_description     = '';
+
+my $conf_file = "/etc/gbrowse_addons.ini";
+my $cfg = Config::Tiny->new;
+$cfg = Config::Tiny->read($conf_file);
+
+my $mysql_username = $cfg->{mysql}{username};
+my $mysql_password = $cfg->{mysql}{password};
+my $gbrowse_user   = $cfg->{main}{gbrowse_user};
+my $main_user = $cfg->{main}{main_user};
+
+my $bp_seqfeature_load = $cfg->{main}{bp_seqfeature_load_location};
+my $bp_genbank2gff3 = $cfg->{main}{bp_genbank2gff3_location};
+
+my $blastdb = $cfg->{main}{blastdb_location};
+
+# Send the form
+my $q = new CGI;
+
+# returning to pick up session data
+if($q->param('session')) {
+	my $session = $q->param('session');
+	print STDERR "******************INSIDE THE SESSION: $session";
+
+	my $cache = get_cache_handle();
+	my $data = $cache->get($session);
+	# something is wrong
+	unless ($data and ref $data eq "ARRAY") {
+		print_html();
+		exit 0;
+	}
+
+	print $q->header;
+	print $q->start_html(-title => "Generating Datasource",
+						($data->[0] ? () :
+							(-head => ["<meta http-equiv=refresh content=5>"])));
+	print $q->h1("Generating Datasource");
+	print $q->pre(escapeHTML($data->[1]));
+	print $q->p(i("... creating ....")) unless $data->[0];
+	print $q->end_html;
+	print STDERR "*******************************Done printing the loading page\n";
+
+	if( $data->[0] ) {
+		print $q->redirect(-url=>"gb2/gbrowse/$db_name");
+	}
+# submitting the form
+} elsif($q->param('accession_numbers')) {
+	# get form results
+	$flat_accession_num = $q->param('accession_numbers');
+	$db_name = $q->param('db_name');
+	$db_name =~ s/ /_/g;
+	$db_description = $q->param('db_description');
+	$db_description =~ s/ /_/g;
+
+
+	# untaint form results
+	if($db_name =~ /(^[a-zA-Z][a-zA-Z0-9\-_]*\b$)/){
+		$db_name = $1;
+	} else {
+		warn ("TAINTED DATA SENT BY $ENV{'REMOTE_ADDR'}");
+	}
+	@accession_numbers = split(' ',$flat_accession_num);
+	my @ut_accession_numbers;
+	foreach my $acc_num (@accession_numbers) {
+		if( $acc_num =~ /(^[A-Za-z][A-Za-z0-9\-_]*$)/){
+			push(@ut_accession_numbers, $1);
+		} else {
+			warn ("TAINTED DATA SENT BY $ENV{'REMOTE_ADDR'}");
+		}
+	}
+
+	# Setup the Cache and Session
+	my $session = get_session_id();
+	my $cache = get_cache_handle();
+	$cache->set($session, [0, ""]); # No data in the cache yet
+
+	# declare the source_name outside of the scope of the children
+	my $source_name;
+
+	# if there are no children
+	if (my $pid = fork) {
+		# clear parameters
+		$q->delete_all();
+		# Set the session
+		$q->param('session', $session);
+		print $q->redirect($q->self_url());
+	# if there is a child
+	} elsif (defined $pid) {
+		close STDOUT;
+		unless (open F, "-|") {
+			open STDERR, ">&=1";
+			$source_name = load_datasource($db_name,$db_description,$blastdb,\@ut_accession_numbers);
+			# print $q->b("Datasource Creation Completed Successfully");
+		}
+		my $buf = "";
+		while (<F>) {
+			$buf .= $_;
+			$cache->set($session, [1, $buf]);
+		}
+		$cache->set($session, [1, $buf]);
+		exit 0;
+	} else {
+		die "Cannot fork: $!";
+	}
+} else {
+	print_html();
+}
+
+exit 0;
+
+sub print_html {
+	print $q->header;
+	print $q->start_html(-title => 'NCBI Datasource Loader',
+						-style => ['http://fonts.googleapis.com/css?family=Lato','../ncbi_loader.css','../../simplegrid.css']);
+	print $q->start_div({-id => "form", -class => "grid grid-pad", -style => "text-align: center"});
+	print $q->start_form(
+		-name    => 'main_form',
+		-method  => 'GET',
+		-enctype =>	&CGI::URL_ENCODED
+		);
+	print $q->h1('NCBI Datasource Loader');
+	print $q->b('Enter the accession numbers for the datasource you would like to add');
+	print $q->br,$q->br,$q->br;
+	print $q->start_div({class=>"input-group"});
+	print $q->label({-class=>"col-1-3", -for => "db_name"},"Datasource Name: "),$q->textfield(
+		-id    =>	'db_name',
+		-name  =>	'db_name',
+		-value => '',
+		-size  => 30,
+		-class => "col-2-3 push-right"
+		),$q->br;
+	print $q->end_div;
+	print $q->start_div({class=>"input-group"});
+	print $q->label({-class=>"col-1-3", -for => "db_description"},"Datasource Description: "),$q->textfield(
+		-id    =>	'db_description',
+		-name  =>	'db_description',
+		-value => '',
+		-size  => 30,
+		-class => "col-2-3 push-right"
+		),$q->br;
+	print $q->end_div;
+	print $q->start_div({class=>"input-group"});
+	print $q->label({-class=>"col-1-3", -for => "accession_numbers",-style => "vertical-align: top;"},"Accession Numbers: "),$q->textarea(
+		-id    =>	'accession_numbers',
+		-name  =>	'accession_numbers',
+		-value =>	'',
+		-cols  =>	53,
+		-rows  =>	5,
+		-class => "col-2-3 push-right"
+		);
+	print $q->end_div;
+	print $q->start_div({class=> 'col-1-1'});
+	print $q->br,$q->submit(
+		-id      => 'submit',
+		-name    => 'submit_form',
+		-value   => 'Create Datasource!',
+		-onclick => 'function(){document.getElementById("form").style.visibility = "hidden";
+								document.getElementById("wait").style.visibility = "visible";}'
+		);
+	print $q->end_div;
+	print $q->end_form;
+	print $q->end_div;
+
+
+	print $q->end_html;
+}
+
+sub load_datasource {
+	use Bio::SeqIO;
+	use Bio::Perl;
+	use Bio::Tools::GFF;
+	use LWP::Simple qw/getstore/;
+	use File::Temp qw/ tempfile tempdir /;
+
+	my $db_name        = shift;
+	my $db_description = shift;
+	my $blast_location = shift;
+	my $arr_ref        = shift;
+	my @get_id         = @{$arr_ref};
+	undef $arr_ref;
+
+	# var declarations
+	my @feature_tags;
+	my @reference_examples;
+	# array of possible feature glyphs for use when generating config files
+	my @glyphs = qw(allele_tower anchored_arrow arrow box cds crossbox diamond dna dot 
+		ellipse extending_arrow graded_segments image 
+		line primers processed_transcript rndrect ruler_arrow segments span toomany 
+		transcript transcript2 translation triangle xyplot wiggle_density 
+		wiggle_xyplot idiogram trace wormbase_transcript);
+
+	# MYSQL database creation
+	my $mysql_result = `mysql -u$mysql_username -p$mysql_password -e \'create database $db_name\'`;
+	$mysql_result    .= `mysql -u$mysql_username -p$mysql_password -e \'grant all privileges on $db_name.* to $main_user\@localhost\'`;
+	$mysql_result    .= `mysql -u$mysql_username -p$mysql_password -e \'grant file on *.* to $main_user\@localhost\'`;
+	$mysql_result    .= `mysql -u$mysql_username -p$mysql_password -e \'grant select on $db_name.* to nobody\@localhost\'`;
+	$mysql_result    .= `mysql -u$mysql_username -p$mysql_password -e \'grant select on $db_name.* to \"$gbrowse_user\"\@\"localhost\"\'`;
+	print STDERR $mysql_result."\n";
+
+	use File::Copy "cp";
+	my $blastdb_fasta = File::Spec->catfile($blast_location,$db_name);
+
+	foreach my $id (@get_id) {
+		# Create tempfiles to hold the genbank and fasta files that will be downloaded from NCBI
+		my ($genbank_fh, $genbank_filename) = tempfile();
+		my ($fasta_fh, $fasta_filename) = tempfile();
+
+		print STDERR "****************ID: $id\n";
+
+		# Get the Genbank and FASTA from NCBI
+		getstore("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nucleotide&rettype=fasta&retmode=text&id=$id",$fasta_filename);
+		getstore("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nucleotide&rettype=gbwithparts&retmode=text&id=$id",$genbank_filename);
+
+		if( -e $blastdb_fasta ) {
+			open my $infile, "<", $fasta_filename or die "unable to open $fasta_filename for reading: $!";
+			open my $outfile, ">>", $blastdb_fasta;
+			while(<$infile>) {
+				print $outfile $_;
+			}
+			close $infile;
+			close $outfile;
+		} else {
+			cp $fasta_filename, $blastdb_fasta;			
+		}
+
+		# Create a fasta SeqIO factory to scrape fasta sequence names for use in the config
+		my $fastain = Bio::SeqIO->new(-file => $fasta_filename,
+									  -format => 'fasta');
+
+		while(my $sequence = $fastain->next_seq){
+			if(@reference_examples < 10){
+				push(@reference_examples,$sequence->display_id);
+			} else {
+				last;
+			}
+		}
+
+		undef $fastain;
+
+		# Create a SeqIO factory to scrape the genbank for feature tags
+		my $seqin = Bio::SeqIO->new(-file => $genbank_filename,
+									-format => 'GenBank');
+
+		while(my $inseq = $seqin->next_seq) {
+			my @feature_array = $inseq->get_SeqFeatures();
+			foreach(@feature_array) {
+				push(@feature_tags, $_->primary_tag());
+			}
+		}
+
+		undef $seqin;
+
+		# convert the genbank to a gff3 file
+		print STDERR "**************************Genbank filename: $genbank_filename";
+		my $out = `$bp_genbank2gff3 --outdir /tmp/ $genbank_filename`;
+		print STDERR $out;
+		my $gff_filename = "$genbank_filename.gff";
+
+		# MYSQL database population
+		my $bulk_load_result;
+		$bulk_load_result = `$bp_seqfeature_load -u $mysql_username -p $mysql_password -f -a DBI::mysql -c -d $db_name $fasta_filename $gff_filename`;
+		print STDERR $bulk_load_result."\n";
+
+		# Delete the tempfiles after use
+		# unlink $fasta_filename;
+		# unlink $genbank_filename;
+	}
+	
+	my $blastdb_result = `makeblastdb -dbtype nucl -parse_seqids -title $db_name -in $blastdb_fasta`;
+
+	# Remove duplicates from the array of feature tags
+	my %temp = map { $_, 0} @feature_tags;
+	@feature_tags = keys %temp;
+
+	# Flatten tag array for use in Config
+	my $default_features = join(" ",@feature_tags);
+
+	# build the feature definitions section of the config
+	my $feature_defintions = "";
+	foreach my $tag (@feature_tags) {
+		$feature_defintions .= "[$tag]\n";
+		$feature_defintions .= "feature\t\t= $tag\n";
+		$feature_defintions .= "bgcolor\t\t= indianred\n";
+		$feature_defintions .= "fgcolor\t\t= black\n";
+		# Check if there is a glyph named similarly to the current feature
+		# 	if such a glyph is found, use it to display the feature
+		# 	use the box glyph otherwise
+		my $glyph = "box";
+		foreach my $temp_glyph (@glyphs) {
+			if(index($temp_glyph, $tag) != -1) {
+				$glyph = $temp_glyph;
+				last; 
+			}
+		}
+		$feature_defintions .= "glyph\t\t= $glyph\n";
+		$feature_defintions .= "height\t\t= 6\n";
+		$feature_defintions .= "balloon width\t= 375\n";
+		$feature_defintions .= "key\t\t= $tag\n\n";
+	}
+
+	my $reference_examples = join(" ",@reference_examples);
+	my $initial_landmark = @reference_examples[0];
+
+	# Create the config string that will become the datasources config file
+	my $config_contents = 
+"[GENERAL]
+description\t= $db_description
+database\t= $db_name
+
+plugins\t= BlastSearch TrackDumper AlignTwoSequences
+
+default features\t= $default_features
+
+examples = $reference_examples
+
+initial landmark = $initial_landmark:100..1000
+
+######################################
+# database definitions
+######################################
+
+[$db_name:database]
+db_adaptor\t= Bio::DB::SeqFeature::Store
+db_args\t\t= -adaptor DBI::mysql
+\t\t  -dsn $db_name
+\t\t  -user nobody
+search options = default +autocomplete
+
+########################
+# Default glyph settings
+########################
+
+[TRACK DEFAULTS]
+glyph         = generic
+database      = $db_name
+height        = 10
+bgcolor       = lightgrey
+fgcolor       = black
+font2color    = blue
+label density = 25
+bump density  = 100
+# where to link to when user clicks in detailed view
+link          = AUTO
+
+################## TRACK CONFIGURATION ####################
+# the remainder of the sections configure individual tracks
+###########################################################
+
+$feature_defintions";
+	# Write the config file
+	unless(open configFile, ">/etc/gbrowse2/$db_name.conf") {
+		die "Unable to create the config file(Check file permissions)";
+	}
+	print configFile $config_contents;
+	close configFile;
+
+	# Add the new datasource to the global gbrowse config
+	my $global_config = 
+"[$db_name]
+description\t= $db_description
+path\t= $db_name.conf\n\n";
+	unless(open globalConfig, ">>/etc/gbrowse2/GBrowse.conf") {
+		die "Unable to open the global configuration file(Check file permissions)";
+	}
+	print globalConfig $global_config;
+	close globalConfig;
+
+	return $db_name;
+}
+
+sub get_cache_handle {
+  require Cache::FileCache;
+
+  Cache::FileCache->new
+      ({
+        namespace => 'ncbi_loader',
+        username => 'nobody',
+        default_expires_in => '60 minutes',
+        auto_purge_interval => '4 hours',
+       });
+}
+
+sub get_session_id {
+    require Digest::MD5;
+
+    Digest::MD5::md5_hex(Digest::MD5::md5_hex(time().{}.rand().$$));
+}
+
+1;

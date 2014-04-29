@@ -1,0 +1,37 @@
+How to add photos to the gallery:
+    1.) go to the joomla administration panel: micro.biology.dal.ca/administrator 
+    2.) go to Content->Media Manager
+    3.) select 'Laroche research gallery' in the left panel
+    4.) any photos uploaded into this gallery will be displayed on the website's photo gallery
+How to add an article to Joomla:
+    Through the main website(micro.biology.dal.ca/):
+        1.) Click Login in the bottom right
+        2.) Login using an account with editor privileges
+        3.) Click 'Create Article' in the bottom right
+        4.) Add your content using the text editor displayed
+        5.) Click on 'Publishing'
+        6.) Set the Category to whichever page you would like your article displayed on
+        7.) Click 'Save'
+    Through the administrator interface(micro.biology.dal.ca/administrator):
+        1.) Login using an account with administrator privileges
+        2.) Go to Content->Article Manager
+        3.) click 'New'
+        4.) Add your content using the text editor displayed
+        5.) on the right hand side of the page set the category to whichever page you would like your article displayed on
+        6.) Click 'Save'
+How to add a user to Joomla:
+    1.) Login to the administrator interface(micro.biology.dal.ca/administrator) using an admin account
+    2.) Click on Users->User Manager
+    3.) Click 'New'
+    4.) Fill in account details
+    5.) Go to 'Assigned User Groups' and add the user to whichever groups are necessary
+        -to publish articles the user should be a part of: author, editor, and publisher
+        -to access the administrator interface they should be a part of: Administrator
+    6.) Click 'Save'
+
+How to install the BlastSearch.pm plugin:
+    1.) Copy the plugin into the GBrowse plugins folder(default: /etc/gbrowse2/plugins/
+    2.) Add the plugin to the plugin line of the configuration file for whichever datasources should have the plugin enabled
+        or add it to the GBrowse.conf file to add the plugin to every datasource
+
+        sample plugin line: "plugins     = BlastSearch TrackDumper RestrictionAnnotator SequenceDumper TrackDumper Submitter AlignTwoSequences"

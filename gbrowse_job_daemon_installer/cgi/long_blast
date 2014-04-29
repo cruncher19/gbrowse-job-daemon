@@ -1,0 +1,301 @@
+#!/usr/bin/perl
+
+$ENV{PATH} = "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin";
+$ENV{HOME} = "/tmp";
+
+# accept form input for long blast jobs and prepare the job information for gbrowse_job_daemon to process
+
+use strict;
+use warnings;
+use LWP::UserAgent;
+use HTTP::Request::Common;
+use CGI;
+use Data::Dumper;
+use Bio::Graphics::Browser2;
+use Bio::Graphics::Browser2::Session;
+use Bio::Graphics::Browser2::UserDB;
+use Data::Dump qw(dump);
+use File::Temp qw/ tempfile tempdir /;
+use lib '/usr/lib/cgi-bin/gb2';
+use upload_to_gbrowse;
+use Config::Tiny;
+use File::Spec::Unix;
+
+use CGI::Cookie;
+
+my $conf_file = "/etc/gbrowse_addons.ini";
+my $cfg = Config::Tiny->new;
+$cfg = Config::Tiny->read($conf_file);
+
+my $blastdb = $cfg->{main}{blastdb_location};
+my $working_dir = $cfg->{main}{gbrowse_job_daemon_location};
+unless( $working_dir =~ /.*\/$/ ) {
+	$working_dir .= "/";
+}
+chdir $working_dir;
+
+my $q = new CGI;
+
+my $globals = Bio::Graphics::Browser2->open_globals;
+my $userdb = Bio::Graphics::Browser2::UserDB->new($globals);
+
+my $session = $globals->session;
+my $sessionid = $session->id;
+my $uploadsid = $session->uploadsid;
+my $username  = $session->username;
+print $q->header;
+print $q->start_html(-title => "BLAST Search for Large Sequences",
+						-style => ['http://fonts.googleapis.com/css?family=Lato','../../long_blast.css','../../simplegrid.css']);
+# 
+# users must be logged in
+if($username){
+	# if the form has been submitted
+	if($q->param('submit_form')){
+		if($q->param('fileUpload') || $q->param('sequence') ne '') {
+			use Bio::Graphics::Browser2;
+			use CGI::Cookie;
+			use Data::Dumper;
+			$Data::Dumper::Terse = 1;
+			use Fcntl qw(:DEFAULT :flock);
+			use Tie::File;
+			my $globals = Bio::Graphics::Browser2->open_globals;
+			my $session = $globals->session;
+			my %cookies = CGI::Cookie->fetch;
+			my $userdb = Bio::Graphics::Browser2::UserDB->new($globals);
+			my $email = $userdb->email_from_sessionid($session->id);
+
+			print $q->start_div({class=>"response"});
+			print "Job request submitted!<br>You will receive an email when your job is complete";
+			print $q->end_div;
+
+			my $upload_filename;
+			# Get and untaint the parameters
+			if( !( $upload_filename = $q->param('fileUpload')) ){
+				(my $upload_fh, $upload_filename) = tempfile( DIR => $working_dir."blast_targets/");
+				print $upload_fh $q->param('sequence');
+				close $upload_filename;
+			} else {
+				my ($fh, $fname) = tempfile( DIR => $working_dir."blast_targets/");
+				my $tmp_str = do{ local $/ = undef; <$upload_filename>};
+				print $fh $tmp_str;
+				$upload_filename = $fname;
+				close $fname;
+			}
+			my $track_name = $q->param('track_name');
+			$track_name =~ s/ /-/g;
+			if( $track_name =~ /([a-zA-z0-9-]{0,75})/ ) {
+				$track_name = $1;
+			}
+			my $blastTarget = $q->param('blastTarget');
+			if( $blastTarget =~ /([a-zA-Z\-\_0-9]*)/) {
+				$blastTarget = $1;
+			}
+			my $queryType     = $q->param('queryType');
+			if( $queryType =~ /([a-zA-Z]*)/) {
+				$queryType = $1;
+			}
+			my $task          = $q->param('task');
+			if( $task =~ /([a-zA-Z\-\_]*)/ ) {
+				$task = $1;
+			}
+			my $evalue        = $q->param('evalue');
+			if( $evalue =~ /([0-9e\-.]{0,15})/ ) {
+				$evalue = $1;
+			}
+			my $wordSize      = $q->param('wordSize');
+			if( $wordSize =~ /([0-9e\-.]{0,15})/ ) {
+				$wordSize = $1;
+			}
+			my $cullingLimit  = $q->param('cullingLimit');
+			if( $cullingLimit =~ /([0-9e\-.]{0,15})/ ) {
+				$cullingLimit = $1;
+			}
+			my $maxTargetSeqs = $q->param('maxTargetSeqs');
+			if( $maxTargetSeqs =~ /([0-9e\-.]{0,15})/ ) {
+				$maxTargetSeqs = $1;
+			}
+
+			# prepare a parameters hash to be dumped to a file for gbrowse_job_daemon to use later
+			my %parameters = (
+				'query'			=> $upload_filename,
+				'queryType'     => $queryType,
+				'blastTarget'	=> $blastTarget,
+				'task'          => $task,
+				'evalue'        => $evalue,
+				'wordSize'      => $wordSize,
+				'cullingLimit'  => $cullingLimit,
+				'maxTargetSeqs' => $maxTargetSeqs
+				);
+
+			# dump the hash
+			my ($config_fh, $config_filename) = tempfile( DIR => $working_dir."configs/");
+			select((select($config_fh), $|=1)[0]);
+			print $config_fh Dumper(\%parameters);
+			close $config_filename;
+
+			# write cookies and session out to a file
+			my ($cookies_fh, $cookies_filename) = tempfile( DIR => $working_dir."cookies/");
+			select((select($cookies_fh), $|=1)[0]);
+			print $cookies_fh Dumper(\%cookies);
+			my ($sessions_fh, $sessions_filename) = tempfile( DIR => $working_dir."sessions/");
+			select((select($sessions_fh), $|=1)[0]);
+			print $sessions_fh $session->id;
+
+			# use Tie::File to elegantly lock the file and add the job line
+			my @jobs;
+			my $tie = tie @jobs, "Tie::File", "jobs" or die "Unable to tie jobs file";
+			$tie->flock;
+
+			my $upload_data = store_upload_params('', $track_name, 'gff3');
+
+			my $line = "blast";
+			$line .= "|$cookies_filename";
+			$line .= "|$sessions_filename";
+			$line .= "|".$config_filename;
+			$line .= "|".$email;
+			$line .= "|".$track_name;
+			$line .= "|$upload_data";
+
+			print STDERR "LINE::::::: $line\n";
+
+			push(@jobs,$line);
+			$tie = undef;
+			untie @jobs;
+
+			close $cookies_filename;
+			close $sessions_filename;
+
+			# print upload_to_gbrowse($upload_filename, \%cookies, $session_id);
+		}
+	# print out the form
+	} else {
+		# get the list of datasources
+		my $ua = LWP::UserAgent->new;
+		my $response = $ua->get('http://localhost/cgi-bin/gb2/gbrowse/Toceanica2/?action=list');
+		my $content = $response->content;
+		my @datasources = $content =~ /^[a-zA-Z0-9_]+/smg;
+
+		print $q->start_div({-class=>"grid grid-pad", -style=>"text-align: center;"});
+		print $q->start_form(
+			-name    => 'main_form',
+			-class   => 'pure-form pure-form-aligned',
+			-method  => 'POST',
+			-enctype =>	&CGI::MULTIPART
+			);
+		print $q->start_div({-class=>"col-1-1", -id=>"header"});
+ 		print $q->h1("BLAST Search for Long Sequences");
+ 		print "Please fill out the following form to submit your BLAST search, leave fields blank for BLAST defaults. You will be notified by email when your BLAST search is complete.";
+ 		print $q->end_div;
+ 		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "track_name"}, "Enter a name for your results: "), $q->textfield(-class=>"col-2-3", -id => "track_name",-name=>"track_name", -default=> "", -size=>10, -maxlength=>100);
+		print $q->end_div;
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for =>"fileUpload"}, "Upload Sequence file: "),$q->filefield(-name=> "fileUpload", -id=> "fileUpload", -default=>'FASTA file',-size=>50,-maxlength=>150);
+		print $q->start_div({class=>"divider"});
+		print " Or ";
+		print $q->end_div;
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "sequence",-style => "vertical-align: top;"},"Enter a Sequence: "),$q->textarea(
+			-id    =>	'sequence',
+			-name  =>	'sequence',
+			-value =>	'',
+			-cols  =>	60,
+			-rows  =>	3,
+			-class => "col-2-3"
+		);
+		my %labels = (
+			'blastn'  => 'Nucleotide Sequence',
+			'tblastn' => 'Protein Sequence');
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "queryType"}, "Query Type: "), $q->radio_group( 
+			-name    => "queryType",
+			-values  => ['blastn','tblastn'], 
+			-default => 'blastn', 
+			-labels  =>\%labels);
+		print $q->end_div;
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => 'blastTarget'}, "Blast Against: "), $q->popup_menu(-class=> "col-2-3", -name => "blastTarget", -id => "blastTarget", -values => \@datasources, default => "Toceanica2" );
+		print $q->end_div;
+		print $q->b(" Advanced Settings ");
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "task"}, "Task: "), $q->popup_menu(-name=>"task",
+			-values=>['blastn','blastn-short','dc-megablast','megablast','rmblastn'],
+			-default=>'blastn',
+			-class=>"col-2-3");
+		print $q->end_div;
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "evalue"}, "Evalue: "), $q->textfield(-class=> "col-2-3 push-right", -id => "evalue",-name=>"evalue", -default=> "", -size=>10, -maxlength=>10);
+		print $q->end_div;
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "wordSize"}, "Word Size: "), $q->textfield(-class=> "col-2-3 push-right", -id => "wordSize",-name=>"wordSize", -default=> "", -size=>10, -maxlength=>10);
+		print $q->end_div;
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "cullingLimit"}, "Culling Limit: "), $q->textfield(-class=> "col-2-3 push-right", -id => "cullingLimit", -name=>"cullingLimit", -default=> "", -size=>10, -maxlength=>10);
+		print $q->end_div;
+		print $q->start_div({class=>"input-group"});
+		print $q->label({-class=>"col-1-3", -for => "maxTargetSeqs"}, "Max Target Sequences: "), $q->textfield(-class=> "col-2-3 push-right", -name=>"maxTargetSeqs", -id => "maxTargetSeqs", -default => "", -size => 10, -maxlength => 10);
+		print $q->end_div;
+		print $q->start_div({class=> 'col-1-1'});
+		print $q->submit(
+			-id    => 'submit',
+			-name  => 'submit_form',
+			-value => 'Start BLAST!');
+		print $q->end_div;
+		print $q->end_form;
+		print $q->end_div;
+	}
+} else {
+	print $q->b("Oops! You aren't logged in");
+}
+print $q->end_html;
+
+# store_params($upload_target, $upload_name, $upload_type)
+# 	$upload_type = 'gff3' or 'featurefile'
+# 	returns the name of the tempfile where the params have been stored
+sub store_upload_params {
+	use File::Temp qw/ tempfile /;
+	use Bio::Graphics::Browser2;
+	use Bio::Graphics::Browser2::Session;
+	use Bio::Graphics::Browser2::UserDB;
+	use Bio::Graphics::Browser2::Render;
+	use Bio::Graphics::Browser2::UserTracks;
+	use Data::Dumper;
+	$Data::Dumper::Terse = 1;
+	
+	my $upload_target = shift;
+	my $upload_name   = shift;
+	my $upload_type   = shift;
+
+	my $globals     = Bio::Graphics::Browser2->open_globals;
+	my $userdb      = Bio::Graphics::Browser2::UserDB->new($globals);
+	my $render      = Bio::Graphics::Browser2::Render->new($globals);
+	my $session     = $render->session;
+	my $data_source = $render->data_source;
+	my $user_tracks = Bio::Graphics::Browser2::UserTracks->new($data_source,$session);
+
+	my $userid         = $userdb->get_user_id($userdb->email_from_sessionid($session->id));
+	my $current_source = ${$session->config_hash}{'page_settings'}{'source'};
+	my $upload_dir     = $globals->user_dir;
+	my $uploadsid      = $session->uploadsid;
+	my $account_db      = $globals->user_account_db;
+
+	my %upload_data;
+	$upload_data{'upload_target'} = $upload_target;
+	$upload_data{'upload_name'}   = $upload_name;
+	$upload_data{'upload_type'}   = $upload_type;
+
+	$upload_data{'userid'}         = $userid;
+	$upload_data{'current_source'} = $current_source;
+	$upload_data{'upload_dir'}     = $upload_dir;
+	$upload_data{'uploadsid'}      = $uploadsid;
+	$upload_data{'account_db'}     = $account_db;
+
+	my ($data_fh, $data_filename) = tempfile;
+	select((select($data_fh), $|=1)[0]);
+	print $data_fh Dumper(\%upload_data);
+	close $data_filename;
+
+	return $data_filename;
+}
+
+1;

@@ -1,0 +1,218 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use CGI;
+use LWP::UserAgent;
+use Config::Tiny;
+use File::Temp qw/ tempfile tempdir /;
+use File::Spec::Unix;
+use Tie::File;
+
+use Bio::Graphics::Browser2;
+use Bio::Graphics::Browser2::Session;
+use Bio::Graphics::Browser2::UserDB;
+
+my $globals = Bio::Graphics::Browser2->open_globals;
+my $userdb = Bio::Graphics::Browser2::UserDB->new($globals);
+
+my $session = $globals->session;
+my $username  = $session->username;
+
+my $conf_file = "/etc/gbrowse_addons.ini";
+my $cfg = Config::Tiny->new;
+$cfg = Config::Tiny->read($conf_file);
+
+my $hmmer_location = $cfg->{main}{hmmer_location};
+my $protein_db_location = $cfg->{main}{protein_database_location};
+my $working_dir = $cfg->{main}{gbrowse_job_daemon_location};
+
+chdir $working_dir;
+
+my $q = new CGI;
+
+if($username) {
+	if($q->param('submit_form')){
+		my $track_name = $q->param('track_name');
+		my $datasource = $q->param('datasource');
+		my $database   = $q->param('database');
+		my $evalue     = $q->param('evalue');
+
+		my ($cookie_filename, $session_filename, $email) = store_parameters();
+
+		# untaint parameters to prevent injection
+		if( $track_name =~ /([a-zA-z0-9-]{0,75})/ ) {
+			$track_name = $1;
+		} else {
+			die "Invalid track name";
+		}
+		if( $evalue =~ /([0-9e\-.]{0,15})/ ) {
+			$evalue = $1;
+		} else {
+			die "Invalid evalue";
+		}
+		if( $datasource =~ /([a-zA-z0-9-]{0,75})/ ) {
+			$datasource = $1;
+		} else {
+			die "Invalid datasource";
+		}
+		if( $database =~ /([a-zA-z0-9-]{0,75})/ ) {
+			$database = $1;
+		} else {
+			die "Invalid database";
+		}
+
+		my %parameters = (
+			'database' => File::Spec->catfile($hmmer_location, $database),
+			'datasource' => File::Spec->catfile($protein_db_location, $datasource."_prot.fas"),
+			'evalue' => $evalue
+		);
+
+		my ($config_fh, $config_filename) = tempfile( DIR => File::Spec->catfile($working_dir, "configs/"));
+		select((select($config_fh), $|=1)[0]);
+		print $config_fh Dumper(\%parameters);
+		close $config_filename;
+
+		my $upload_data = store_upload_params('', $track_name, 'gff3');
+
+		my $line = "hmmer";
+		$line    .= "|$cookie_filename";
+		$line    .= "|$session_filename";
+		$line    .= "|$config_filename";
+		$line    .= "|$email";
+		$line    .= "|$track_name";
+		$line    .= "|$upload_data";
+
+		# use Tie::File to elegantly lock the file and add the job line
+		my @jobs;
+		my $tie = tie @jobs, "Tie::File", "jobs" or die "Unable to tie jobs file";
+
+		$tie->flock;
+		push(@jobs,$line);
+
+		$tie = undef;
+		untie @jobs;
+
+		print $q->header;
+		print $q->start_html(-title => "HMMER Search for Genome Scaffolds",
+							-style => ['http://fonts.googleapis.com/css?family=Lato']);
+		print $q->b("track_name: $track_name<br>datasource: $datasource<br>database: $database<br>evalue: $evalue<br>cookie file: $cookie_filename<br>session file: $session_filename<br>Jobs line: $line");
+		print $q->end_html;
+
+	} else {
+		print_html();					
+	}
+} else {
+	print $q->header;
+	print $q->start_html(-title => "HMMER Search for Genome Scaffolds",
+						-style => ['http://fonts.googleapis.com/css?family=Lato']);
+	print $q->b("Oops! You aren't logged in");
+	print $q->end_html;
+}
+
+
+
+sub print_html {
+	my $ua = LWP::UserAgent->new;
+	my $response = $ua->get('http://localhost/cgi-bin/gb2/gbrowse/Toceanica2/?action=list');
+	my $content = $response->content;
+	my @datasources = $content =~ /^[a-zA-Z0-9_]+/smg;
+
+	my @databases = ("Pfam-A", "Pfam-B", "ModEnza-EC");
+
+	print $q->header;
+	print $q->start_html(-title => "HMMER Search for Genome Scaffolds",
+						-style => ['http://fonts.googleapis.com/css?family=Lato']);
+	print $q->start_form(
+			-name    => 'main_form',
+			-class   => 'pure-form pure-form-aligned',
+			-method  => 'POST',
+			-enctype =>	&CGI::MULTIPART
+			);
+	print $q->label({-for => "track_name"}, "Enter a name for your results: "), $q->textfield(-id => "track_name",-name=>"track_name", -default=> "", -size=>10, -maxlength=>100);
+	print $q->label({-for => 'datasource'}, "Datasource: "), $q->popup_menu(-name => "datasource", -id => "datasource", -values => \@datasources, default => "Toceanica2" );
+	print $q->label({-for => 'database'}, "Database: "), $q->popup_menu(-name => "database", -id => "database", -values => \@databases);
+	print $q->label({-for => "evalue"}, "Evalue: "), $q->textfield(-id => "evalue",-name=>"evalue", -default=> "", -size=>10, -maxlength=>10);
+	print $q->submit(
+			-id    => 'submit',
+			-name  => 'submit_form',
+			-value => 'Start HMMER!');
+	print $q->end_form;
+	print $q->end_html;
+}
+
+sub store_parameters {
+	use Bio::Graphics::Browser2;
+	use CGI::Cookie;
+	use Data::Dumper;
+	$Data::Dumper::Terse = 1;
+	use Fcntl qw(:DEFAULT :flock);
+	use Tie::File;
+	use File::Spec::Unix;
+	my $globals = Bio::Graphics::Browser2->open_globals;
+	my $session = $globals->session;
+	my %cookies = CGI::Cookie->fetch;
+	my $userdb = Bio::Graphics::Browser2::UserDB->new($globals);
+	my $email = $userdb->email_from_sessionid($session->id);
+	
+	my ($cookies_fh, $cookies_filename) = tempfile( DIR => File::Spec->catfile($working_dir, "cookies/"));
+	select((select($cookies_fh), $|=1)[0]);
+	print $cookies_fh Dumper(\%cookies);
+	my ($sessions_fh, $sessions_filename) = tempfile( DIR => File::Spec->catfile($working_dir, "sessions/"));
+	select((select($sessions_fh), $|=1)[0]);
+	print $sessions_fh $session->id;
+	close $cookies_fh;
+	close $sessions_fh;
+
+	my $email = $userdb->email_from_sessionid($session->id);
+
+	return $cookies_filename, $sessions_filename, $email;
+}
+
+# 	returns the name of the tempfile where the params have been stored
+sub store_upload_params {
+	use File::Temp qw/ tempfile /;
+	use Bio::Graphics::Browser2;
+	use Bio::Graphics::Browser2::Session;
+	use Bio::Graphics::Browser2::UserDB;
+	use Bio::Graphics::Browser2::Render;
+	use Bio::Graphics::Browser2::UserTracks;
+	use Data::Dumper;
+	$Data::Dumper::Terse = 1;
+	
+	my $upload_target = shift;
+	my $upload_name   = shift;
+	my $upload_type   = shift;
+
+	my $globals     = Bio::Graphics::Browser2->open_globals;
+	my $userdb      = Bio::Graphics::Browser2::UserDB->new($globals);
+	my $render      = Bio::Graphics::Browser2::Render->new($globals);
+	my $session     = $render->session;
+	my $data_source = $render->data_source;
+	my $user_tracks = Bio::Graphics::Browser2::UserTracks->new($data_source,$session);
+
+	my $userid         = $userdb->get_user_id($userdb->email_from_sessionid($session->id));
+	my $current_source = ${$session->config_hash}{'page_settings'}{'source'};
+	my $upload_dir     = $globals->user_dir;
+	my $uploadsid      = $session->uploadsid;
+	my $account_db      = $globals->user_account_db;
+
+	my %upload_data;
+	$upload_data{'upload_target'} = $upload_target;
+	$upload_data{'upload_name'}   = $upload_name;
+	$upload_data{'upload_type'}   = $upload_type;
+
+	$upload_data{'userid'}         = $userid;
+	$upload_data{'current_source'} = $current_source;
+	$upload_data{'upload_dir'}     = $upload_dir;
+	$upload_data{'uploadsid'}      = $uploadsid;
+	$upload_data{'account_db'}     = $account_db;
+
+	my ($data_fh, $data_filename) = tempfile;
+	select((select($data_fh), $|=1)[0]);
+	print $data_fh Dumper(\%upload_data);
+	close $data_filename;
+
+	return $data_filename;
+}

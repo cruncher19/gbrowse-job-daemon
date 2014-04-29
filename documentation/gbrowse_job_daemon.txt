@@ -1,0 +1,35 @@
+The job daemon runs as a system service.
+
+Operation:
+    it can be started and stopped like this:
+    
+        sudo service gbrowse_job_daemon stop
+        sudo service gbrowse_job_daemon start
+        sudo service gbrowse_job_daemon restart
+
+    The daemon writes to a log file at /var/log/gbrowse_job_daemon.log
+
+
+How it works:
+    The job daemons monitors the file: /usr/share/gbrowse_job_daemon/jobs
+        entries in the jobs file have the following format:
+            task|name of file containing dumped cookie|name of file containing dumped session|name of file containing job configuration|user email address|name of file containing upload parameters
+
+            ex:
+            blast|/usr/share/gbrowse_job_daemon/cookies/J6apldUI8M|/usr/share/gbrowse_job_daemon/sessions/T1cAd_1u23|/usr/share/gbrowse_job_daemon/configs/NWCy2OALcr|bradcovey@gmail.com|testblast|/tmp/q8SFVfhGdy
+    
+    Every 15 seconds(I think?) the job daemon spawns a child
+
+        if the jobs file is empty the child exits without doing anything
+        otherwise the child gets the first job off of the top of the file and processes it
+
+        The child determines what to do based on the "task" section of the jobs entry.
+
+        The child performs the task, stores the results, and modifies the file containing upload parameters to include the paths to the results.
+        The child adds an entry to the completed_jobs file and exits
+    
+    After spawning the child the parent checks each of its active children processes to see if they are ready to be reaped
+    if the parent reaps a child it spawns a headless(self reaping) child that pulls the first entry out of the completed_jobs file and performs the upload
+    To perform the upload the child calls upload_data with the name of the file containing upload parameters
+
+    Next the child sends an email to the user telling them that their job is complete and the child exits

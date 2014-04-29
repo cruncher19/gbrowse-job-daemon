@@ -1,0 +1,1076 @@
+#!/usr/bin/perl -w
+#
+# gbrowse_job_daemon by Brad Covey
+#
+# Free software. Use this as you wish.
+#
+# Throughout this template "mydaemon" is used where the name of your daemon should
+# be, replace occurrences of "mydaemon" with the name of your daemon.
+#
+# This name will also be the exact name to give this file (WITHOUT a ".pl" extension).
+#
+# It is also the exact name to give the start-stop script that will go into the
+# /etc/init.d/ directory.
+#
+# It is also the name of the log file in the /var/log/ directory WITH a ".log"
+# file extension.
+#
+
+use strict;
+use warnings;
+use POSIX;
+use File::Pid;
+use lib '/usr/lib/cgi-bin/gb2/';
+use lib '/usr/lib/cgi-bin/gbrowse/';
+use expression_ratios;
+use Fcntl qw(:DEFAULT :flock);
+use File::Temp qw/ tempfile tempdir /;
+use Tie::File;
+use File::chdir;
+use POSIX qw(setsid);
+use Data::Dumper;
+use Devel::StackTrace;
+use MIME::Lite;
+use File::Spec::Unix;
+$Data::Dumper::Terse = 1;
+
+# make "mydaemon.log" file in /var/log/ with "chown root:adm mydaemon"
+
+my $daemonName    = "gbrowse_job_daemon";
+#
+my $dieNow        = 0;                                     # used for "infinte loop" construct - allows daemon mode to gracefully exit
+my $sleepMainLoop = 15;                                    # number of seconds to wait between "do something" execution after queue is clear
+my $logging       = 1;                                     # 1= logging is on
+my $logFilePath   = "/var/log/";                           # log file path
+my $logFile       = $logFilePath . $daemonName . ".log";
+my $pidFilePath   = "/var/run/";                           # PID file path
+my $pidFile       = $pidFilePath . $daemonName . ".pid";
+
+my $max_processes = 3;
+my $working_dir = "/usr/share/gbrowse_job_daemon/";
+my $blastdb_dir = "/home/guest/blastdb/";
+# chdir ($working_dir) or logEntry("cannot change: $!\n");
+# print  "\nCurrent Directory is $ENV{PWD} \n";
+$CWD = $working_dir;
+my @children;
+
+# start a new log file if the current log gets too large
+if( -s "/var/log/gbrowse_job_daemon.log" > 1.049e+6 ) {
+	my $count = 1;
+	while( -e "/var/log/gbrowse_job_daemon.log.$count" ) {
+		$count++;
+	}
+	rename "/var/log/gbrowse_job_daemon.log", "/var/log/gbrowse_job_daemon.log.$count";
+}
+
+# daemonize
+umask 0;
+open STDIN,  '/dev/null'   or die "Can't read /dev/null: $!";
+open STDOUT, '>>/var/log/gbrowse_job_daemon.log' or die "Can't write to /dev/null: $!";
+open STDERR, '>>/var/log/gbrowse_job_daemon.log' or die "Can't write to /dev/null: $!";
+defined( my $pid = fork ) or die "Can't fork: $!";
+exit if $pid;
+
+# dissociate this process from the controlling terminal that started it and stop being part
+# of whatever process group this process was a part of.
+POSIX::setsid() or die "Can't start a new session.";
+
+# callback signal handler for signals.
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = \&signalHandler;
+$SIG{PIPE} = 'ignore';
+
+# create pid file in /var/run/
+my $pidfile = File::Pid->new( { file => $pidFile, } );
+
+$pidfile->write or die "Can't write PID file, /dev/null: $!";
+
+# turn on logging
+if ($logging) {
+	open LOG, ">>$logFile";
+	select((select(LOG), $|=1)[0]); # make the log file "hot" - turn off buffering
+}
+
+# Loop until the daemon is told to die
+until ($dieNow) {
+	sleep($sleepMainLoop);
+	my $pid;
+	# fork if there are less than the maximum number of children
+	if( @children < $max_processes ) {
+		$pid = fork();
+	} else {
+		$pid = undef;
+	}
+	# If this is the parent process do this:
+	if($pid || !defined $pid) {
+		# I must be the parent
+		push( @children, $pid );
+		# push the pid of the child that was just created onto the stack of children
+		foreach my $curr_pid (@children) {
+			# if I am the parent
+			if( ($curr_pid != -1) && (my $tmp = waitpid($curr_pid, WNOHANG)) ) {
+				@children = grep {$_ ne $curr_pid} @children;
+				# !kill( 0, $_ )
+				# my $tmp = waitpid($_, 0);
+				# process any completed jobs that are currently in the completed_jobs file
+				if( -s 'completed_jobs' ){
+					my @completed_jobs;
+					# Open the completed jobs file using Tie and Flock
+					# flock locks the file, this prevents race conditions
+					# Tie provides an easy way of removing the top line from the file
+					my $tie = tie @completed_jobs, "Tie::File", "completed_jobs" or logEntry("Unable to tie completed_jobs file");
+					$tie->flock;
+
+					# get the first line out of the completed jobs file
+					my $line = shift @completed_jobs;
+					$tie = undef;
+					untie @completed_jobs;
+					my @response = split('\|',$line);
+
+					# split the job line into individual arguments
+					my $task          = $response[0];
+					my $cookie_fname  = $response[1];
+					my $session_fname = $response[2];
+					my $config_fname  = $response[3];
+					my $email         = $response[4];
+					my $output_fname  = $response[5];
+					my $track_name    = $response[6];
+					my $upload_data   = $response[7];
+
+					# Fork to perform the upload without blocking the parent
+					# This is necessary for large uploads, otherwise the daemon would need to wait for the upload to complete before accepting new jobs
+					my $upload_pid = fork;
+					unless($upload_pid) {
+						# redirect SDOUT/STDIN and dissasosciate from parent so that the child process doesn't become a zombie after completion
+						logEntry("Child here! Starting the upload, we're about to lose contact :S");
+						chdir("/") || die "can't chdir to /: $!";
+						open(STDIN, "< /dev/null") || die "can't read /dev/null: $!";
+						open(STDOUT, ">>/var/log/gbrowse_job_daemon.log") || die "can't write to /dev/null: $!";
+						(setsid() != -1) || die "Can't start a new session: $!";
+						print STDERR "STARTING UPLOAD\n";
+						# perform the upload
+						my $conf_feature_name = upload_data($upload_data) or logEntry("Data upload Failed!: $!");
+						# delete the upload target
+						unlink $output_fname;
+
+						my $upload_data_hash = restore_params($upload_data);
+						# Notify the user
+						if($task eq 'expression') {
+							# Get all the information that needs to be passed to the results page as part of the URL
+							$upload_data   = restore_params($upload_data);
+							my $config     = restore_params($config_fname);
+							my $hit_count = $upload_data->{'hit_count'};
+							my $variance = $upload_data->{'variance'};
+							my $datasource = $config->{'reference'};
+							# Notify user that job is complete, include link to results page in email
+							my $msg = MIME::Lite->new(
+							     To      => $email,
+							     Subject => 'Your requested expression ratio calculation is complete',
+							     Type    => 'text/html',
+							     Data    => "<h1>Expression Ratio Calculation Complete</h1><br>Log in to GBrowse and click \"Select Tracks\" to enable your graph track. Your track is called: $track_name<br><br>Your track can be managed from the \"Custom Tracks\" page.<br><a href=\"http://micro.biology.dal.ca/cgi-bin/gb2/expression_results?hit_count=$hit_count&variance=$variance&datasource=$datasource\">Click here to see an index of your results"
+							);
+							my $val = $msg->send();
+						} elsif($task eq 'blast') {
+							# get all the information that needs to be passed to the results page as part of the URL
+							print STDERR "getting information\n";
+							$upload_data   = restore_params($upload_data);
+							my $config     = restore_params($config_fname);
+							my $datasource = $config->{'blastTarget'};
+							my $blast      = $upload_data->{'blast_result'};
+							chmod 0777, $blast or die "unable to set permissions\n";
+							print STDERR "Sending the email\n";
+							# Notify user that job is complete, include link to results page in email
+							my $msg = MIME::Lite->new(
+							     To      => $email,
+							     Subject => 'Your Requested BLAST job is complete',
+							     Type    => 'text/html',
+							     Data    => "<h1>BLAST Complete</h1><br>Log in to GBrowse and click \"Select Tracks\" to enable your hit track. Your track is called: $track_name<br><br>Your track can be managed from the \"Custom Tracks\" page.<br><a href=\"http://micro.biology.dal.ca/cgi-bin/gb2/results?track=$track_name&blast=$blast&datasource=$datasource&conf_name=$conf_feature_name\">Click here to see an index of your results"
+							);
+							my $val = $msg->send();
+						} elsif($task eq 'hmmer') {
+							# notify user
+							# include link to results summary page in email
+						} else {
+							# Notify the user when an unrecognized job is uploaded
+							my $msg = MIME::Lite->new(
+							     To      => $email,
+							     Subject => 'Your Requested BLAST job is complete',
+							     Type    => 'text/html',
+							     Data    => "<h1>Problem Encountered</h1><br>Unable to upload results, unrecognized filetype created by script"
+							);
+							my $val = $msg->send();
+						}
+
+
+						logEntry("Job completed, user notified");
+						exit;
+					}
+
+					logEntry("Child spawned to perform upload")
+				} else {
+				}
+			} else {
+			}
+		}
+	# If this is the child process do this:
+	} elsif ($pid == 0){
+		use Switch;
+		use Bio::Tools::GFF;
+		use Bio::SearchIO;
+		use Bio::Graphics::Feature;
+
+		redirect_streams();
+		# I must be the child
+		my @jobs;
+		# lock the jobs file and use Tie::File to elegantly pull one line
+		my $tie = tie @jobs, "Tie::File", "jobs" or logEntry("Unable to tie jobs file: $!");
+		$tie->flock;
+		
+		my $line;
+		# child exits and waits to be reaped if the jobs file is empty 
+		unless ( $line = shift @jobs ) {
+			$tie = undef;
+			untie @jobs;
+			exit 0;
+		}
+		$tie = undef;
+		untie @jobs;
+
+		my @request = split('\|',$line);
+
+		# split the request line into individual arguments
+		my $task           = $request[0];
+		my $cookie_fname   = $request[1];
+		my $session_fname  = $request[2];
+		my $config_fname   = $request[3];
+		logEntry("Task: $task Cookie_fname: $cookie_fname Session_fname: $session_fname Config_fname: $config_fname");
+		open my $tmp, "<", $request[3] or die "unable to open parameter file: $!";
+		my $tmp_str        = do{ local $/ = undef; <$tmp>};
+		logEntry("Parameter string: $tmp_str");
+		close $tmp;
+		my %parameter_hash = %{eval $tmp_str};
+		undef $tmp_str;
+
+
+		my $request_email = $request[4];
+		my $track_name    = $request[5];
+		my $upload_data   = $request[6];
+		# Execute job
+		switch ($task) {
+			case "blast" {
+				# Prepare parameters
+				my ($blastTarget, $maxTargetSeqs, $evalue, $query, $cullingLimit, $task, $queryType, $wordSize);
+				if( $parameter_hash{'blastTarget'} ) {
+					$blastTarget = '-db '.$blastdb_dir.$parameter_hash{'blastTarget'};
+				} else {						
+					warn "No target included in request!?\n";
+				}
+				if( $parameter_hash{'query'} ) {
+					$query = '-query '.$parameter_hash{'query'};
+				} else {
+					warn "No query included in request!?\n";						
+				}
+				if($parameter_hash{'task'}) {
+					$task = '-task '.$parameter_hash{'task'};
+				}
+				if($parameter_hash{'maxTargetSeqs'}) {
+					$maxTargetSeqs = '-max_target_seqs '.$parameter_hash{'maxTargetSeqs'};
+				}
+				if($parameter_hash{'evalue'}) {
+					$evalue = '-evalue '.$parameter_hash{'evalue'};
+				}
+				if($parameter_hash{'cullingLimit'}) {
+					$cullingLimit = '-culling_limit '.$parameter_hash{'cullingLimit'};
+				}
+				unless( $queryType = $parameter_hash{'queryType'}) {
+					warn "Query type not specified in BLAST request";
+				}
+				if($parameter_hash{'wordSize'}) {
+					$wordSize = '-word_size '.$parameter_hash{'wordSize'};
+				}
+				# format the BLAST results and store them to be uploaded to GBrowse
+				my ($blast_fh, $blast_filename) = tempfile( DIR => $working_dir."output_files/");
+				close $blast_filename;
+
+				# Do the BLAST
+				my $blast_result = `$queryType $query $task $blastTarget $evalue $wordSize $cullingLimit $maxTargetSeqs -outfmt 6 -out $blast_filename -num_threads 4`;
+				logEntry("Blast Result ".$blast_result);
+				
+				my ($gff_fh, $gff_filename) = tempfile( DIR => $working_dir."output_files/");
+				close $gff_filename;
+
+				# Setup the factories to convert the BLAST output to a GFF3
+				my $parser = new Bio::SearchIO(
+					-format => 'blasttable',
+					-file   => $blast_filename
+				);
+
+				my $out = new Bio::Tools::GFF(
+					-gff_version => 3,
+					-file        => ">$gff_filename"
+				);
+
+				# process the results into a gff3 file
+				while( my $result = $parser->next_result ) {
+					while( my $hit = $result->next_hit ) {
+						while( my $hsp = $hit->next_hsp ) {
+							$out->write_feature(
+								Bio::Graphics::Feature->new(
+									-start  => $hsp->start('hit'),
+									-end    => $hsp->end('hit'),
+									-seq_id => $hit->name,
+									-score  => $hsp->score,					
+									-name   => $result->query_name.' Evalue: '.$hsp->evalue.' Bit Score: '.$hsp->bits().' Query Length: '.$hsp->length('query').' Alignment Length: '.$hsp->length('total').' Hit Strand: '.$hsp->strand('hit').' Query Strand: '.$hsp->strand('query'),
+									-strand => $hsp->strand('hit'),
+									-source_tag => "blast",
+									-primary_tag => "hit"
+								)
+							);
+						}
+					}
+				}
+
+				# set file permissions so the file is accessible to the login script(daemon runs as root, script runs as www-data)
+				chmod 0777, $gff_filename or die "unable to set permissions\n";
+
+				close $blast_filename;
+				close $gff_filename;
+
+				# Open the upload_data configuration
+				my $upload_data_hash = restore_params($upload_data);
+				# Add the GFF3 file and the BLAST output file to the upload_data hash
+				$upload_data_hash->{'upload_target'} = $gff_filename;
+				$upload_data_hash->{'blast_result'}  = $blast_filename;
+				# Write the upload_data hash back to its file
+				open my $tmp_fh, ">", $upload_data or die "Unable to open upload_data: $upload_data: $!";
+				select((select($tmp_fh), $|=1)[0]);
+				print $tmp_fh Dumper($upload_data_hash);
+				close $tmp_fh;
+
+				# build up the completed_jobs line
+				my $line = $request[0];
+				$line .= "|$cookie_fname";
+				$line .= "|$session_fname";
+				$line .= "|$config_fname";
+				$line .= "|$request_email";
+				$line .= "|$gff_filename";
+				$line .= "|$track_name";
+				$line .= "|$upload_data";
+
+				# add the line to the completed_jobs file
+				my @completed_jobs;
+				my $tie = tie @completed_jobs, "Tie::File", "completed_jobs" or die "Unable to tie jobs file\n";
+				$tie->flock;
+
+				push(@completed_jobs,$line);
+				print "Completed Jobs: ".$completed_jobs[0]."\n";
+
+				$tie = undef;
+				untie @completed_jobs;
+
+				print "Child finishing\n";
+				# Child is done, it exits and waits to be reaped by the parent
+				exit 0;
+			}
+			case 'expression' {
+				my $task;
+				if( $parameter_hash{'task'} ) {
+					$task = $parameter_hash{'task'};
+				} else {						
+					die "No task included in expression request!?\n";
+				}
+
+				# calculate_expression($reference, 'cve', $experimental, $control)
+				# calculate_expression($reference, 'dvr', $dna, $rna)
+				# calculate_expression($reference, 'dor', $file )
+				# calculate_expression($reference, 'dorm', $file1, $file2, $file3, $file4...)
+
+				# Do different things depending on which expression calculation is necessary
+				if($task eq 'cve') {
+					my ($control, $experimental, $reference);
+					if( $parameter_hash{'control'} ) {
+						$control = $parameter_hash{'control'};
+					} else {						
+						die "No target included in request!?\n";
+					}
+					if( $parameter_hash{'experimental'} ) {
+						$experimental = $parameter_hash{'experimental'};
+					} else {						
+						die "No target included in request!?\n";
+					}
+					if( $parameter_hash{'reference'} ) {
+						$reference = $blastdb_dir.$parameter_hash{'reference'};
+					} else {
+						die "No reference database in request!?";
+					}
+					
+					my $upload_data_hash = restore_params($upload_data);
+
+					# Create a unique configuration identifier based on the track name and the userid
+					# Needs to be done here because this information is not available inside the calculate_expression subroutine
+					my $conf_id = "expression_".substr(${$upload_data_hash}{userid},0,6)."_$track_name";
+					# Calculate the expression ratio
+					my ($feature_file, $hit_count_file, $max_var_file) = calculate_expression($track_name, $reference, $conf_id, 'cve', $experimental, $control);
+					print STDERR "HIT COUNT FILE: $hit_count_file\nMax Var File $max_var_file\n";
+					
+					# add the results files to the upload_data_hash for use by the parent when uploading
+					$upload_data_hash->{'upload_target'} = $feature_file;
+					$upload_data_hash->{'hit_count'}     = $hit_count_file;
+					$upload_data_hash->{'variance'}      = $max_var_file;
+					open my $tmp_fh, ">", $upload_data or die "Unable to open upload_data: $upload_data: $!";
+					select((select($tmp_fh), $|=1)[0]);
+					print $tmp_fh Dumper($upload_data_hash);
+					close $tmp_fh;
+
+					my $completed_string = 'expression';
+					$completed_string .= "|$cookie_fname";
+					$completed_string .= "|$session_fname";
+					$completed_string .= "|$config_fname";
+					$completed_string .= "|$request_email";
+					$completed_string .= "|$feature_file";
+					$completed_string .= "|$track_name";
+					$completed_string .= "|$upload_data";
+
+					add_to_completed($completed_string);
+					logEntry('Job Completed and added to the list to be uploaded');
+				} elsif($task eq 'dvr') {
+					my ($dna, $rna, $reference);
+					if( $parameter_hash{'dna'} ) {
+						$dna = $parameter_hash{'dna'};
+					} else {
+						die "No target included in request!?\n";
+					}
+					if( $parameter_hash{'rna'} ) {
+						$rna = $parameter_hash{'rna'};
+					} else {						
+						die "No target included in request!?\n";
+					}
+					if( $parameter_hash{'reference'} ) {
+						$reference = $blastdb_dir.$parameter_hash{'reference'};
+					} else {
+						die "No reference database in request!?";
+					}
+					
+					my $upload_data_hash = restore_params($upload_data);
+
+					# Create a unique configuration identifier based on the track name and the userid
+					# Needs to be done here because this information is not available inside the calculate_expression subroutine
+					my $conf_id = "expression_".substr(${$upload_data_hash}{userid},0,6)."_$track_name";
+					# calculate the expression ratio
+					my ($feature_file, $hit_count_file, $max_var_file) = calculate_expression($track_name, $reference, $conf_id, 'dvr', $dna, $rna);
+
+					# add the results files to the upload_data_hash for use by the parent when uploading
+					$upload_data_hash->{'upload_target'} = $feature_file;
+					$upload_data_hash->{'hit_count'}     = $hit_count_file;
+					$upload_data_hash->{'variance'}      = $max_var_file;
+					open my $tmp_fh, ">", $upload_data or die "Unable to open upload_data: $upload_data: $!";
+					select((select($tmp_fh), $|=1)[0]);
+					print $tmp_fh Dumper($upload_data_hash);
+					close $tmp_fh;
+
+					my $completed_string = 'expression';
+					$completed_string .= "|$cookie_fname";
+					$completed_string .= "|$session_fname";
+					$completed_string .= "|$config_fname";
+					$completed_string .= "|$request_email";
+					$completed_string .= "|$feature_file";
+					$completed_string .= "|$track_name";
+					$completed_string .= "|$upload_data";
+
+					add_to_completed($completed_string);
+					logEntry('Job Completed and added to the list to be uploaded');
+				} elsif($task eq 'dor') {
+					my ($file, $reference);
+					if( $parameter_hash{'file'} ) {
+						$file = $parameter_hash{'file'};
+					} else {						
+						die "No target included in request!?\n";
+					}
+					if( $parameter_hash{'reference'} ) {
+						$reference = $blastdb_dir.$parameter_hash{'reference'};
+					} else {
+						die "No reference database in request!?";
+					}
+					
+					my $upload_data_hash = restore_params($upload_data);
+
+					# Create a unique configuration identifier based on the track name and the userid
+					# Needs to be done here because this information is not available inside the calculate_expression subroutine
+					my $conf_id = "expression_".substr(${$upload_data_hash}{userid},0,6)."_$track_name";
+					my ($feature_file, $hit_count_file, $max_var_file) = calculate_expression($track_name, $reference, $conf_id, 'dor', $file);
+
+					# add the results files to the upload_data_hash for use by the parent when uploading
+					$upload_data_hash->{'upload_target'} = $feature_file;
+					$upload_data_hash->{'hit_count'}     = $hit_count_file;
+					$upload_data_hash->{'variance'}      = $max_var_file;
+					open my $tmp_fh, ">", $upload_data or die "Unable to open upload_data: $upload_data: $!";
+					select((select($tmp_fh), $|=1)[0]);
+					print $tmp_fh Dumper($upload_data_hash);
+					close $tmp_fh;
+
+					my $completed_string = 'expression';
+					$completed_string .= "|$cookie_fname";
+					$completed_string .= "|$session_fname";
+					$completed_string .= "|$config_fname";
+					$completed_string .= "|$request_email";
+					$completed_string .= "|$feature_file";
+					$completed_string .= "|$track_name";
+					$completed_string .= "|$upload_data";
+
+					add_to_completed($completed_string);
+					logEntry('Job Completed and added to the list to be uploaded');
+				} elsif($task eq 'dorm') {
+					my @files;
+					my $reference;
+					if( $parameter_hash{'files'} ) {
+						@files = @{$parameter_hash{'files'}};
+					} else {						
+						die "No target included in request!?\n";
+					}
+					if( $parameter_hash{'reference'} ) {
+						$reference = $blastdb_dir.$parameter_hash{'reference'};
+					} else {
+						die "No reference database in request!?";
+					}
+					
+					my $upload_data_hash = restore_params($upload_data);
+
+					# Create a unique configuration identifier based on the track name and the userid
+					# Needs to be done here because this information is not available inside the calculate_expression subroutine
+					my $conf_id = "expression_".substr(${$upload_data_hash}{userid},0,6)."_$track_name";
+					my ($feature_file, $hit_count_file, $max_var_file) = calculate_expression($track_name, $reference, $conf_id, 'dorm', @files);
+
+					$upload_data_hash->{'upload_target'} = $feature_file;
+					$upload_data_hash->{'hit_count'}     = $hit_count_file;
+					$upload_data_hash->{'variance'}      = $max_var_file;
+					open my $tmp_fh, ">", $upload_data or die "Unable to open upload_data: $upload_data: $!";
+					select((select($tmp_fh), $|=1)[0]);
+					print $tmp_fh Dumper($upload_data_hash);
+					close $tmp_fh;
+
+					# add the results files to the upload_data_hash for use by the parent when uploading
+					my $completed_string = 'expression';
+					$completed_string .= "|$cookie_fname";
+					$completed_string .= "|$session_fname";
+					$completed_string .= "|$config_fname";
+					$completed_string .= "|$request_email";
+					$completed_string .= "|$feature_file";
+					$completed_string .= "|$track_name";
+					$completed_string .= "|$upload_data";
+
+					add_to_completed($completed_string);
+					logEntry('Job Completed and added to the list to be uploaded');
+				} else {
+					die "$task is an invalid expression task";
+				}
+
+				exit 0;
+			}
+			case 'hmmer' {
+				my ($hmmdb,$protfile,$evalue);
+				if( $parameter_hash{'database'} ) {
+					$hmmdb = $parameter_hash{'database'};
+				} else {
+					warn "No HMM db included in request!?\n";	
+				}
+
+				if( $parameter_hash{'datasource'} ) {
+					$protfile = $parameter_hash{'datasource'};
+				} else {
+					warn "No HMM db included in request!?\n";	
+				}
+
+				if( $parameter_hash{'evalue'} ) {
+					$evalue = '-E '.$parameter_hash{'evalue'};
+				} else {
+					warn "No E-value included in request!?\n";	
+				}
+
+				my ($hmmer_fh, $hmmer_filename) = tempfile( DIR => $working_dir."output_files/");
+				close $hmmer_filename;
+
+				my $hmmer_result = `hmmscan --domtblout $hmmer_filename --cpu 4 $evalue $hmmdb $protfile`;
+				logEntry("Hmmer Result ".$hmmer_result);
+				
+				my ($gff_fh, $gff_filename) = tempfile( DIR => $working_dir."output_files/");
+				close $gff_filename;
+
+				# Setup the factories to convert the BLAST output to a GFF3
+				my $parser = new Bio::SearchIO(
+					-format => 'blasttable',
+					-file   => $blast_filename
+				);
+
+				my $out = new Bio::Tools::GFF(
+					-gff_version => 3,
+					-file        => ">$gff_filename"
+				);
+
+
+			}
+			else {
+				warn "Requested Task Not Found\n";
+				exit 0;
+			}
+		}
+		# format results and store info in completed_jobs
+		exit 0;
+	} else {
+		logEntry("couldn't fork: $!\n");
+	}
+}
+
+# add a line to the log file
+sub logEntry {
+	my ($logText) = @_;
+	my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime(time);
+	my $dateTime = sprintf "%4d-%02d-%02d %02d:%02d:%02d", $year + 1900, $mon + 1, $mday, $hour, $min, $sec;
+	if ($logging) {
+		print LOG "$dateTime $logText\n";
+	}
+}
+
+# add_to_completed($string)
+# adds the given string to the completed_jobs file
+sub add_to_completed {
+	my $line = shift;
+
+	my @completed_jobs;
+	my $tie = tie @completed_jobs, "Tie::File", $working_dir."completed_jobs" or die "Unable to tie jobs file\n";
+	$tie->flock;
+
+	push(@completed_jobs,$line);
+
+	$tie = undef;
+	untie @completed_jobs;
+
+	return 1;
+}
+
+# redirects the error and output streams back to their proper end points
+sub restore_streams {
+  close(STDOUT) || die "Can't close STDOUT: $!";
+  close(STDERR) || die "Can't close STDERR: $!";
+  open(STDERR, ">&OLDERR") || die "Can't restore stderr: $!";
+  open(STDOUT, ">&OLDOUT") || die "Can't restore stdout: $!";
+}
+
+# redirects the error and output streams to the logfile
+sub redirect_streams {
+  open OLDOUT,">&STDOUT" || die "Can't duplicate STDOUT: $!";
+  open OLDERR,">&STDERR" || die "Can't duplicate STDERR: $!";
+  open(STDOUT,">> $logFile");
+  open(STDERR,">&STDOUT");
+}
+
+# catch signals and end the program if one is caught.
+sub signalHandler {
+	$dieNow = 1;    # this will cause the "infinite loop" to exit
+}
+
+# do this stuff when exit() is called.
+END {
+	if ($logging) { close LOG }
+	$pidfile->remove if defined $pidfile;
+}
+
+# Upload data to gbrowse as a custom track
+# the information necessary for the upload is passed to the subroutine in the form of a filename
+# the filename points to a file containing a dumped hash of upload parameters
+# the file is loaded, the parameters are split, and the upload is performed based on the parameters
+sub upload_data {
+	use Bio::DB::SeqFeature::Store;
+	use File::Spec::Unix;
+	use Data::Pwgen qw(pwgen);
+	use File::Basename;
+	use File::Temp qw/ tempfile /;
+	use Digest::MD5 qw(md5_hex);
+
+	my $data_file = shift;
+	my $data = restore_params($data_file);
+
+	# The file to be uploaded
+	my $upload_target = $data->{'upload_target'};
+	# What it will be called
+	my $upload_name   = $data->{'upload_name'};
+	# The type of file being uploaded, currently supports: gff3, and featurefile
+	my $upload_type   = $data->{'upload_type'};
+	# The datasource that is currently active e.x: "Toceanica2"
+	my $current_source = $data->{'current_source'};
+	# The custom tracks directory
+	my $upload_dir     = $data->{'upload_dir'};
+	# The user's uploadsid(taken from GBrowse)
+	my $uploadsid      = $data->{'uploadsid'};
+	# The accounts database
+	my $account_db     = $data->{'account_db'};
+	# The user's id(different from the uploadsid, also taken from GBrowse)
+	my $userid         = $data->{'userid'};
+
+	if( $account_db =~ /^DBI:SQLite:(\/.*)/ ) {
+		$account_db = $1;
+	} else {
+		die "Uploader failed, incorrect user account database type.\nCurrently this script only supports SQLite :(";
+	}
+
+	# Create the necessary folder structure
+	# File::Spec is used to combine paths and ensure proper formatting
+	my $user_dir = File::Spec->catdir($upload_dir,$current_source);
+	create_dir($user_dir);
+	my $upload_loc = File::Spec->catdir($user_dir,$uploadsid); 
+	create_dir($upload_loc);
+	my $feature_loc = File::Spec->catdir($upload_loc,$upload_name);
+	create_dir($feature_loc);
+	create_dir(File::Spec->catdir($feature_loc,"SOURCES"));
+
+	# generate a unique identifier for our new custom track
+	my $trackid = md5_hex($userid.$upload_name.$current_source);
+
+	# connect to the SQLite database where users are stored
+	my $dbh = DBI->connect("dbi:SQLite:dbname=$account_db","","") or die $DBI::errstr;
+	my $sth = $dbh->prepare("SELECT * FROM uploads WHERE trackid = ?;");
+	$sth->execute($trackid);
+
+	# regenerate the unique identifier until it is unique
+	while( $sth->fetchrow_arrayref() ) {
+		# $trackid = pwgen 32;
+		# $trackid = lc $trackid;
+		$trackid = md5_hex($userid.$upload_name.$current_source);
+		$sth->execute($trackid);
+	}
+
+
+	my $source_filename = File::Spec->catfile($feature_loc,"SOURCES",basename($upload_target));
+
+	my ($conf_fh, $conf_filename) = tempfile;
+	select((select($conf_fh), $|=1)[0]);
+	my ($load_fh, $load_filename) = tempfile;
+	select((select($load_fh), $|=1)[0]);
+
+	my $conf_flag = 0;
+	my $conf_lines = 0;
+
+	open my $infile, "<", $upload_target or die "unable to open upload target: $!";
+	open my $outfile, ">", $source_filename or die "unable to open upload output file: $source_filename $!";
+	select((select($outfile), $|=1)[0]);
+	# When expression ratio results(featurefiles) are passed to the subroutine they contain both the configuration and the data
+	# This splits the two pieces of information, for long_blast data this won't do anything
+	while( my $line = <$infile>)  {
+	    if( $line =~ /^\[.*/ ) {
+	    	$conf_flag = 1;
+	    	if( $conf_lines ) {
+	    		print $conf_fh "\n";
+	    	}
+	    }
+	    if($conf_flag) {
+	    	if($line =~ /^\n/) {
+	    		$conf_flag = 0;
+	    		$line = <$infile>;
+	    	} else {
+	    		print $conf_fh $line;
+	    		$conf_lines++;
+	    	}
+	    } else {
+	    	print $load_fh $line;
+	    	print $outfile $line;
+	    }
+	}
+	# If conf_filename has zero size call the generic_config subroutine to generate a conf
+	unless($conf_lines) {
+		generic_config($load_filename,$conf_filename,$upload_type);
+	}
+
+	# getting the feature name for use later
+	seek $conf_fh,0,0;
+	my $count = 0;
+	my $conf_feature_name;
+	print STDERR "SCANNING CONF: $conf_filename\n";
+	while(<$conf_fh>) {
+		if( $_ =~ /\[(.*)\]/){
+			$conf_feature_name = $1;
+			last;
+		}
+	}
+
+	close $conf_filename;
+	close $load_filename;
+	unlink $infile;
+	close $outfile;
+
+	# get the path to the new sqlite database for the custom track that is being created
+	my $upload_db = File::Spec->catfile($feature_loc,"index.SQLite");
+
+
+	# Load the upload target into a new SQLite database, procedure is different depending on file type
+	print STDERR "UPLOAD TYPE: $upload_type\n";
+	if( lc $upload_type eq "gff3") {
+		load_gff3($load_filename, $upload_db);
+	} else {
+		load_featurefile($load_filename, $upload_db);
+	}
+
+
+	# create featurename.conf
+	my $feature_conf_filename = File::Spec->catfile($feature_loc,$upload_name.".conf");
+	open my $feature_conf, ">", $feature_conf_filename;
+
+	# generating some boilerplate that is necessary for the track to work properly
+	my $sub = substr $uploadsid, 0, 6;
+	my $db_name = "$sub\_$upload_name";
+	print $feature_conf "[$db_name:database]\n";
+	print $feature_conf "db_adaptor\t=\tBio::DB::SeqFeature::Store\n";
+	print $feature_conf "db_args\t\t=\t-adaptor DBI::SQLite\n";
+	print $feature_conf "\t\t\t-dsn $upload_db\n";
+	print $feature_conf "search options\t=\tdefault +wildcard +stem\n";
+	print $feature_conf "\n";
+	print $feature_conf "#>>>>>>>>>> cut here <<<<<<<<\n";
+
+	# writing the conf out to a file
+	open $conf_fh, "<", $conf_filename or die "Unable to open $conf_filename: $!";
+	while (<$conf_fh>) {
+		print $feature_conf $_;
+		if( $_ =~ /^\[.*/) {
+			print $feature_conf "database\t= $db_name\n";
+		}
+	}
+	close $conf_fh;
+
+	# create STATUS
+	my $status_filename = File::Spec->catfile($feature_loc, "STATUS");
+	open my $status_fh, ">", $status_filename or die "Unable to open $status_filename: $!";
+	print $status_fh "processing complete";
+	close $status_fh;
+
+
+	# add entry to SQLite user db
+	my $current_time = strftime("%Y-%m-%d %H:%M:%S\n", localtime(time));
+	$sth = $dbh->prepare("INSERT INTO uploads (userid, sharing_policy, path, trackid, data_source, modification_date, creation_date, title, imported)
+							VALUES (?, 'private', ?, ?, ?, ?, ?, ?, '0');");
+	$sth->execute($userid, $upload_name, $trackid, $current_source, $current_time, $current_time, $upload_name);
+
+	print STDERR "CONF FEATURE NAME: $conf_feature_name\n";
+	return $conf_feature_name;
+
+	sub create_dir {
+		my $dir = shift;
+		if( -d $dir ) {
+			return 1;
+		} else {
+			mkdir $dir or die "Unable to create directory";
+			return 1;
+		}
+	}
+
+	sub load_featurefile {
+		use Bio::DB::SeqFeature::Store;
+		use Bio::Graphics::Feature;
+		# use Bio::DB::SeqFeature::Store::FeatureFileLoader;
+
+		# my $load_target = shift;
+		# my $db_target   = shift;
+
+		# my ($conf_fh, $conf_filename) = tempfile;
+		# my ($load_fh, $load_filename) = tempfile;
+
+		# my $db = init_seqfeature_store($db_target);
+
+		# my $loader = Bio::DB::SeqFeature::Store::FeatureFileLoader->new(-store => $db);
+
+		# $loader->load($load_target);
+
+		# return 1;
+
+		my $load_target = shift;
+		print STDERR "LOAD TARGET: $load_target\n";
+		my $db_target   = shift;
+
+		print "Creating the database\n";
+		my $db = Bio::DB::SeqFeature::Store->new( -adaptor => 'DBI::SQLite',
+												-dsn => $db_target,
+												-write => 1,
+												-create => 1);
+		$db->init_database(1);
+
+		open my $fh, "<", $load_target or die "Unable to open $load_target: $!";
+		my $count = 0;
+
+		my $type = '';
+		my $name = '';
+		my $start;
+		my $end;
+		my $score;
+		my $reference = '';
+		my $feature;
+		my @features;
+		# scan through the featurefile, convert each line into a feature
+		# every 10,000 features, store in the database 
+		while (<$fh>) {
+			$count++;
+			if( ($_ eq "\n" || $_ eq '') && defined $feature ) {
+				$reference = '';
+				push @features, $feature;
+				undef $feature;
+			} elsif( $_ =~ /^reference=(.*)/ ) {
+				$reference = $1;
+			} elsif( $_ =~ /^(.*)\t(.*)\t([0-9]*)..([0-9]*)\tscore=([\-\.0-9]*)/ ) {
+				$type = $1;
+				$name = $2;
+				$start = $3;
+				$end = $4;
+				$score = $5;
+				if( !defined($score) ) {
+					$score = 0;
+				} else {
+					no warnings 'numeric';
+					if($score != 0){
+						# print "$reference score: $score\n";
+					}
+				}
+				if( !$feature ) {
+					$feature = Bio::Graphics::Feature->new(
+													-seq_id => $reference,
+													-start => $start,
+													-end => $end,
+													-name => $name,
+													-type => $type,
+													-score => $score);
+				} else {
+					$feature->add_SeqFeature(Bio::Graphics::Feature->new(
+													-seq_id => $reference,
+													-start => $start,
+													-end => $end,
+													-name => $name,
+													-type => $type,
+													-score => $score
+						));
+				}
+				if($count % 500 == 0) {
+					# print "processed line $count\n";
+				}
+				if(@features > 10000) {
+					print "storing\n";
+					$db->store(@features);
+					undef(@features);
+				}
+				undef $type;
+				undef $name;
+				undef $start;
+				undef $end;
+				undef $score;
+			} else {
+				unless ( $_ eq "\n" ) {
+					die "Unexpected line encountered in upload target";
+				}
+			}
+		}
+
+		close $fh;
+		return 1;
+	}
+
+	sub load_gff3 {
+		use Bio::DB::SeqFeature::Store::GFF3Loader;
+		my $load_target = shift;
+		my $db_target   = shift;
+
+		print STDERR "LOAD TARGET: $load_target\n";
+		print STDERR "DB TARGET: $db_target\n";
+
+
+		my ($conf_fh, $conf_filename) = tempfile;
+		my ($load_fh, $load_filename) = tempfile;
+
+		my $db = init_seqfeature_store($db_target);
+
+		my $loader = Bio::DB::SeqFeature::Store::GFF3Loader->new(-store => $db,
+																-verbose => 1);
+
+		$loader->load($load_target);
+
+		return 1;
+	}
+
+	sub init_seqfeature_store {
+		my $db_target = shift;
+
+		return Bio::DB::SeqFeature::Store->new( -adaptor => 'DBI::SQLite',
+												-dsn => $db_target,
+												-write => 1,
+												-create => 1);
+	}
+
+	sub generic_config {
+		my $load_filename = shift;
+		my $conf_filename = shift;
+		my $type          = shift;
+
+		print STDERR "LOAD FILENAME: $load_filename\n";
+
+		my @glyphs = qw(allele_tower anchored_arrow arrow box cds crossbox diamond dna dot 
+			ellipse extending_arrow graded_segments image 
+			line primers processed_transcript rndrect ruler_arrow segments span toomany 
+			transcript transcript2 translation triangle xyplot wiggle_density 
+			wiggle_xyplot idiogram trace wormbase_transcript);
+		# array of possible glyph colors for use when generating config files
+		my @COLORS = qw(red green blue orange cyan black 
+			turquoise brown indigo wheat yellow emerald);
+
+		use Bio::Graphics::FeatureFile;
+		use Bio::Tools::GFF ;
+
+		my $loader;
+		if( (lc $type) eq "gff3" ) {
+			$loader = Bio::Tools::GFF->new(-gff_version => 3,
+											-file 		=> $load_filename);
+		} elsif( (lc $type) eq "featurefile" ) {
+			$loader = Bio::Graphics::FeatureFile->new(-file => $load_filename)->get_seq_stream;
+		}
+
+		my @features;
+		while(my $feature = $loader->next_feature) {
+			push(@features, $feature->primary_tag());
+		}
+		@features = keys %{{ map { $_ => 1 } @features }};
+
+		my $feature_definitions = "";
+		foreach my $tag (@features) {
+			$feature_definitions .= "[$tag\_$upload_name]\n";
+			$feature_definitions .= "feature\t\t= $tag\n";
+			my $tmp = $COLORS[rand @COLORS];
+			$feature_definitions .= "bgcolor\t\t= $tmp\n";
+			$tmp = $COLORS[rand @COLORS];
+			$feature_definitions .= "fgcolor\t\t= $tmp\n";
+			# Check if there is a glyph named similarly to the current feature
+			# 	if such a glyph is found, use it to display the feature
+			# 	use the box glyph otherwise
+			my $glyph = "box";
+			foreach my $temp_glyph (@glyphs) {
+				if(index($temp_glyph, $tag) != -1) {
+					$glyph = $temp_glyph;
+					last; 
+				}
+			}
+			$feature_definitions .= "glyph\t\t= $glyph\n";
+			$feature_definitions .= "height\t\t= 6\n";
+			$feature_definitions .= "balloon width\t= 375\n";
+		}
+
+		open my $conf_fh, ">", $conf_filename or die "Unable to open $conf_filename for writing: $!";
+		print $conf_fh $feature_definitions;
+		close $conf_fh;
+
+		return \@features;
+	}
+}
+
+# restore_params($data_file)
+# 	returns a hashref containing the params
+sub restore_params {
+	my $data_file = shift;
+
+	open my $temp, "<", "$data_file" or die("unable to open data file: $data_file: $!");
+	my $data_str = do{ local $/ = undef; <$temp>};
+	my %data = %{eval $data_str};
+	undef $data_str;
+	close $temp;
+
+	return \%data;
+}

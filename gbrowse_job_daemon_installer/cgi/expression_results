@@ -1,0 +1,82 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use CGI;
+
+use Bio::Graphics::Browser2;
+use Bio::Graphics::Browser2::Session;
+use Bio::Graphics::Browser2::UserDB;
+use Bio::Graphics::Browser2::Render;
+use Bio::Graphics::Browser2::UserTracks;
+
+
+my $q                  = new CGI;
+
+my $hit_count_filename = $q->param('hit_count');
+my $max_var_filename   = $q->param('variance');
+my $datasource         = $q->param('datasource');
+# my $feature            = $q->param('feature');
+
+my $globals            = Bio::Graphics::Browser2->open_globals;
+my $userdb             = Bio::Graphics::Browser2::UserDB->new($globals);
+my $session            = $globals->session;
+my $sessionid          = $session->id;
+my $uploadsid          = $session->uploadsid;
+my $username           = $session->username;
+
+my $browser2 = Bio::Graphics::Browser2->new('/etc/gbrowse2/GBrowse.conf');
+
+my $render = Bio::Graphics::Browser2::Render::HTML->new($globals);
+my $session = $render->session;
+my $data_source = $render->data_source;
+my $language = $render->language;
+
+my $user_tracks = Bio::Graphics::Browser2::UserTracks->new($data_source, $session);
+
+print $q->header;
+print $q->start_html( -title => "Expression Results",
+					-style => ['../../simplegrid.css', 'http://fonts.googleapis.com/css?family=Lato', '../../exp_results.css'],
+					);
+
+print $q->start_div({-class=>"grid grid-pad"});
+print $q->start_div({-class=>"col-1-2"});
+print $q->h1("Total Base Pair Count");
+print "<table style=\"border-width: 1px; border-style: solid;\">";
+print "<tr>";
+print "<th>Reference ID</th>";
+print "<th>Hit Count</th>";
+print "</tr>";
+open my $hit_count_fh, "<", $hit_count_filename or die "Unable to open hit count file: $hit_count_filename because: $!";
+while(<$hit_count_fh>) {
+	my @line = split("\t",$_);
+	print "<tr>";
+		print "<td><a href=\"/cgi-bin/gb2/gbrowse/$datasource/?name=".$line[0]."\" target=\"_blank\">".$line[0]."</a></td>";
+		print "<td>".$line[1]."</td>";
+	print "</tr>";
+}
+close $hit_count_fh;
+print "</table>";
+print $q->end_div;
+
+print $q->start_div({-class=>"col-1-2"});
+print $q->h1("Maximum Variance");
+print "<table style=\"border-width: 1px; border-style: solid;\">";
+print "<tr>";
+print "<th>Reference ID</th>";
+print "<th>Max Variance</th>";
+print "</tr>";
+open my $max_var_fh, "<", $max_var_filename or die "Unable to open max var file: $max_var_filename because: $!";
+while(<$max_var_fh>) {
+	my @line = split("\t",$_);
+	print "<tr>";
+		print "<td><a href=\"/cgi-bin/gb2/gbrowse/$datasource/?name=".$line[0]."\" target=\"_blank\">".$line[0]."</a></td>";
+		print "<td>".$line[1]."</td>";
+	print "</tr>";
+}
+close $max_var_fh;
+print "</table>";
+print $q->end_div;
+print $q->end_div;
+print $q->end_html;
+1;

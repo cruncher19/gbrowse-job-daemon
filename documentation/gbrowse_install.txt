@@ -1,0 +1,75 @@
+Instructions for basic gbrowse setup:http://www.gmod.org/wiki/GBrowse_Ubuntu_HOWTO
+
+Setting up SQL: 
+	install mysql server + client   
+http://gmod.org/wiki/GBrowse_Backends#Using_Bio::DB::SeqFeature::Store_with_the_MySQL_Backend
+
+mysql -uuname -ppword -e 'create database $db_name'
+mysql -uuname -ppword -e 'grant all privileges on $db_name.* to guest@localhost'
+mysql -uuname -ppword -e 'grant file on *.* to guest@localhost'
+mysql -uuname -ppword -e 'grant select on $db_name.* to nobody@localhost'
+mysql -uuname -ppword -e 'grant select on $db_name.* to "www-data"@"localhost"'
+
+mysql -uuname -ppword'create database toceanica'
+mysql -uuname -ppword'grant file on *.* to dhwani@localhost'
+mysql -uuname -ppword'grant select on toceanica.* to www-data@localhost'
+mysql -uuname -ppword'grant select on toceanica.* to "www-data"@localhost'
+note: replace mysql root uname and pword with the password
+
+bioperl comes preinstalled with ubuntu
+
+Command used to load the data:
+
+bp_seqfeature_load -uuname -p pword -f -a DBI::mysql -c -d toceanica /home/guest/Toceanica/To3_20100719_scaffolds.fa /home/guest/Toceanica/To3_scaffolds.gff3 /home/guest/Toceanica/To3_augustus.gff3 /home/guest/Toceanica/custom_prot_ML.gff3 /home/guest/Toceanica/To3_20100201_LK_est.gff3 /home/guest/Toceanica/To3_p98_ML_est.gff3 /home/guest/Toceanica/gpf-extrinsic-hints-ass3-processed.gff3 /home/guest/Toceanica/Fracy1_GeneModels_AllModels_20090218_aa.gff3 /home/guest/Toceanica/Phatr2_GeneModels_AllModels_20070514_aa.gff3 /home/guest/Toceanica/Phyca1_unfiltered_proteins.gff3 /home/guest/Toceanica/Phyra1_1_unfiltered_proteins.gff3 /home/guest/Toceanica/Physo1_1_unfiltered_proteins.gff3 /home/guest/Toceanica/proteins.Auran1_FilteredModels3.gff3 /home/guest/Toceanica/Thaps3_GeneModels_AllModels_20070514_aa.gff3
+note: replace unmae with mysql root username and pword with the password
+
+Next steps:
+	Create configuration for new datasource
+	setup user accounts
+
+
+Setting up user accounts:
+	1.) Open GBrowse.conf, normally found in /etc/gbrowse/ or /etc/gbrowse2/ depending on the 
+		version of GBrowse2 that was installed(apt-get gives a slightly older version)
+	2.) change 'user_accounts' to 1
+	3.) change 'user_accounts_registration' to 1
+	4.) uncomment the line below '#For SQLite'(should be 'user_account_db = .......')
+	5.) save the file
+	5.) run 'sudo gbrowse_metadb_config' with the path to the gbrowse global config
+		you just edited
+		e.x: 'sudo gbrowse_metadb_config /etc/gbrowse/GBrowse.conf'
+	6.) User accounts should now be working!
+
+Create configuration for new datasource:
+	1.) Start with 'Toceanica.conf' as the base for your configuration
+		All of the features in the Toceanica dataset are configured already
+		if needed the documentation for track definitions is here:
+			http://gmod.org/wiki/GBrowse_2.0_HOWTO#Track_Definitions
+	2.) First you should setup the database definitions
+		You should change dsn to the name of the database the data was added to(note: this is case sensitive!)
+		change user to www-data
+	4.) Description is used to identify the datasource, change if necessary
+	5.) Save your edited conf file to the gbrowse directory, normally either /etc/gbrowse/ or /etc/gbrowse2/
+	6.) Open GBrowse.conf for editing(you will probably need root) and scroll down to the bottm
+	7.) Add a descriptor for the new Toceanica datasource copying the ones above
+		example: 	[Toceanica]
+				description     = Toceanica database
+				path            = Toceanica.conf
+		note: the path IS case sensitive
+	8.) Your new datasource should be working!
+
+
+Add the following to gbrowse's Render.pm after line 1678:
+if( !$f->sub_SeqFeature && $f->strand < 0 ) {
+        $position = $f->end."..".$f->start;
+}
+
+This fixes directional glyphs for certain types of features
+
+Perl Modules needed for the gbrowse_job_daemon:
+cpan -i Data::Dump
+sudo cpan -i File::Pid
+sudo cpan -i File::chdir
+sudo cpan -i MIME::Lite
+
+

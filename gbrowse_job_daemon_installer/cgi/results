@@ -1,0 +1,114 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use Bio::Graphics::Browser2;
+use Bio::Graphics::Browser2::Session;
+use Bio::Graphics::Browser2::UserDB;
+use Bio::Graphics::Browser2::Render;
+use Bio::Graphics::Browser2::UserTracks;
+
+use CGI;
+
+my $q = new CGI;
+
+my $track      = $q->param('track');
+my $blastfile  = $q->param('blast');
+my $datasource = $q->param('datasource');
+
+# /cgi-bin/gb2/gbrowse/Toceanica2/?name=scaffold_15020:410..686
+
+my $globals   = Bio::Graphics::Browser2->open_globals;
+my $userdb    = Bio::Graphics::Browser2::UserDB->new($globals);
+my $session   = $globals->session;
+my $sessionid = $session->id;
+my $uploadsid = $session->uploadsid;
+my $username  = $session->username;
+
+my $browser2 = Bio::Graphics::Browser2->new('/etc/gbrowse2/GBrowse.conf');
+
+my $render = Bio::Graphics::Browser2::Render::HTML->new($globals);
+my $session = $render->session;
+my $data_source = $render->data_source;
+my $language = $render->language;
+
+my $user_tracks = Bio::Graphics::Browser2::UserTracks->new($data_source,$session);
+# my @features = get_features();
+
+
+print $q->header;
+print $q->start_html( -title => 'BLAST Results',
+			-style => ['http://fonts.googleapis.com/css?family=Lato', '../../results.css'],
+			-script => {-type => 'JAVASCRIPT',
+						-src => '../../enable_track.js'
+						}
+			);
+# print "<table style=\"position: fixed; top: 5px; background-color: white; padding-top: 5px;\">";
+# print "<tr>";
+# print "<th>Query ID</th>";
+# print "<th>Database Seq ID</th>";
+# print "<th>Percentage Identity</th>";
+# print "<th>Alignment Length</th>";
+# print "<th>Mismatch Count</th>";
+# print "<th>Gap Opening Count</th>";
+# print "<th>Query Start</th>";
+# print "<th>Query End</th>";
+# print "<th>Subject Start</th>";
+# print "<th>Subject End</th>";
+# print "<th>Expect Value</th>";
+# print "<th>HSP Bit Score</th>";
+# print "</tr>";
+# print "</table>";
+
+
+print "<table style=\"border-width: 1px; border-style: solid;\">";
+print "<tr>";
+print "<th>Query ID</th>";
+print "<th>Database Seq ID</th>";
+print "<th>Percentage Identity</th>";
+print "<th>Alignment Length</th>";
+print "<th>Mismatch Count</th>";
+print "<th>Gap Opening Count</th>";
+print "<th>Query Start</th>";
+print "<th>Query End</th>";
+print "<th>Subject Start</th>";
+print "<th>Subject End</th>";
+print "<th>Expect Value</th>";
+print "<th>HSP Bit Score</th>";
+print "</tr>";
+
+open my $blast_fh, "<", $blastfile or die "unable to open $blastfile for reading: $!";
+while (<$blast_fh>) {
+    my @line = split("\t",$_);
+    print "<tr>";
+    print "<td>".$line[0]."</td>";
+    print "<td><a href=\"/cgi-bin/gb2/gbrowse/$datasource/?name=".$line[1].":".$line[8]."..".$line[9]."\" target=\"_blank\">".$line[1]."</a></td>";
+    print "<td>".$line[2]."</td>";
+    print "<td>".$line[3]."</td>";
+    print "<td>".$line[4]."</td>";
+    print "<td>".$line[5]."</td>";
+    print "<td>".$line[6]."</td>";
+    print "<td>".$line[7]."</td>";
+    print "<td>".$line[8]."</td>";
+    print "<td>".$line[9]."</td>";
+    print "<td>".$line[10]."</td>";
+    print "<td>".$line[11]."</td>";
+    print "</tr>";
+}
+
+print "</table>";
+
+
+# print $q->b("cgi working<br><br>");
+# use Data::Dumper;
+# print $render->render_multiple_choices(\@features, "hilite some tags");
+
+print $q->end_html;
+
+sub get_features {
+	use Bio::DB::SeqFeature::Store;
+	my $db = Bio::DB::SeqFeature::Store->new( -adaptor => 'DBI::SQLite',
+									 		-dsn => "/var/lib/gbrowse2/userdata/Toceanica2/9cdc86bb8c954d289158d1550dec03be/Blast-Search/index.SQLite");
+	return $db->get_all_features;
+}
